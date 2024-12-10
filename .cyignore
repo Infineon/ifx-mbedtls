@@ -1,0 +1,13 @@
+3rdparty
+ChangeLog
+ChangeLog.d
+cmake
+configs
+docs
+doxygen
+output
+programs
+scripts
+tests
+tmp
+visualc

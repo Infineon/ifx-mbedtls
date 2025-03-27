@@ -24,6 +24,9 @@
 #include "mbedtls/platform.h"
 
 #if defined(IFX_PSA_CRYPTO_BUILTIN_KEYS)
+
+#include "ifx_se_psacrypto.h"
+
 typedef struct
 {
     psa_key_id_t key_id;                 /* Key id associated to the builtin key */
@@ -69,9 +72,11 @@ static const mbedtls_psa_builtin_key_description_t builtin_keys[] = {
     { PSA_CRYPTO_IFX_SE_ATTEST_PUB_KEY_ID,
       PSA_CRYPTO_IFX_SE_ATTEST_PUB_SLOT_NUMBER,
       PSA_KEY_LIFETIME_FROM_PERSISTENCE_AND_LOCATION(
-        PSA_KEY_PERSISTENCE_READ_ONLY, PSA_KEY_LOCATION_IFX_SE ) },
+        PSA_KEY_PERSISTENCE_READ_ONLY, PSA_KEY_LOCATION_IFX_SE ) }
+};
 
 #if defined(TEST_IFX_ADDITIONAL_BUILTIN_KEYS)
+static const mbedtls_psa_builtin_key_description_t builtin_test_keys[] = {
     { PSA_CRYPTO_IFX_SE_AES_KEY_ID,
       PSA_CRYPTO_IFX_SE_AES_SLOT_NUMBER,
       PSA_KEY_LIFETIME_FROM_PERSISTENCE_AND_LOCATION(
@@ -101,8 +106,8 @@ static const mbedtls_psa_builtin_key_description_t builtin_keys[] = {
       PSA_CRYPTO_IFX_SE_CMACKDF_SLOT_NUMBER,
       PSA_KEY_LIFETIME_FROM_PERSISTENCE_AND_LOCATION(
         PSA_KEY_PERSISTENCE_READ_ONLY, PSA_KEY_LOCATION_IFX_SE ) }
-#endif /* TEST_IFX_ADDITIONAL_BUILTIN_KEYS */
 };
+#endif /* TEST_IFX_ADDITIONAL_BUILTIN_KEYS */
 
 /** Platform function to obtain the location and slot number of a built-in key.
  *
@@ -146,16 +151,25 @@ psa_status_t mbedtls_psa_platform_get_builtin_key(
 {
     psa_key_id_t app_key_id = MBEDTLS_SVC_KEY_ID_GET_KEY_ID( key_id );
 
-    const mbedtls_psa_builtin_key_description_t *builtin_key;
+    const mbedtls_psa_builtin_key_description_t *key_slots = builtin_keys;
+    size_t key_slots_size = sizeof(builtin_keys) / sizeof(builtin_keys[0]);
 
-    for( size_t i = 0;
-         i < ( sizeof( builtin_keys ) / sizeof( builtin_keys[0] ) ); i++ )
+#if defined(TEST_IFX_ADDITIONAL_BUILTIN_KEYS)
+    if (app_key_id >= PSA_CRYPTO_IFX_SE_TEST_SLOT_MIN)
     {
-        builtin_key = &builtin_keys[i];
-        if( builtin_key->key_id == app_key_id )
+        /* Test builtin keys located in the different key data array */
+        key_slots = builtin_test_keys;
+        key_slots_size = sizeof(builtin_test_keys) / sizeof(builtin_test_keys[0]);
+    }
+#endif /* TEST_IFX_ADDITIONAL_BUILTIN_KEYS */
+
+    for ( size_t i = 0; i < key_slots_size; i++ )
+    {
+        if (app_key_id == key_slots[i].key_id)
         {
-            *lifetime = builtin_key->lifetime;
-            *slot_number = builtin_key->slot_number;
+            *lifetime = key_slots[i].lifetime;
+            *slot_number = key_slots[i].slot_number;
+
             return( PSA_SUCCESS );
         }
     }
@@ -183,7 +197,7 @@ psa_status_t ifx_mbedtls_get_builtin_key(
 {
     psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
 
-    if( key_buffer_size < sizeof( mbedtls_svc_key_id_t ) )
+    if( key_buffer_size < sizeof( ifx_se_key_id_fih_t ) )
         return( PSA_ERROR_BUFFER_TOO_SMALL );
 
     switch( slot_number )
@@ -363,9 +377,21 @@ psa_status_t ifx_mbedtls_get_builtin_key(
 
     if (status == PSA_SUCCESS)
     {
-        *( (mbedtls_svc_key_id_t*) key_buffer ) =
-            mbedtls_svc_key_id_make(0, builtin_keys[slot_number].key_id);
-        *key_buffer_length = sizeof( mbedtls_svc_key_id_t );
+        const mbedtls_psa_builtin_key_description_t *key_slots = builtin_keys;
+        psa_drv_slot_number_t slot_id = slot_number;
+
+#if defined(TEST_IFX_ADDITIONAL_BUILTIN_KEYS)
+        if (slot_number >= PSA_CRYPTO_IFX_SE_TEST_SLOT_MIN)
+        {
+            /* Test builtin keys located in the different key data array */
+            key_slots = builtin_test_keys;
+            slot_id = slot_number - PSA_CRYPTO_IFX_SE_TEST_SLOT_MIN;
+        }
+#endif /* TEST_IFX_ADDITIONAL_BUILTIN_KEYS */
+
+        *( (ifx_se_key_id_fih_t*) key_buffer ) =
+            ifx_se_key_id_fih_make(0, key_slots[slot_id].key_id);
+        *key_buffer_length = sizeof( ifx_se_key_id_fih_t );
     }
 
     return( status );

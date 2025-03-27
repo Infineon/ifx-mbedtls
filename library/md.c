@@ -340,6 +340,8 @@ int mbedtls_md_clone(mbedtls_md_context_t *dst,
         return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
     }
 
+    int ret_status = 0;
+
 #if defined(MBEDTLS_MD_SOME_PSA)
     if (src->engine != dst->engine) {
         /* This can happen with src set to legacy because PSA wasn't ready
@@ -400,10 +402,10 @@ int mbedtls_md_clone(mbedtls_md_context_t *dst,
             break;
 #endif
         default:
-            return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+            ret_status = MBEDTLS_ERR_MD_BAD_INPUT_DATA;
     }
 
-    return 0;
+    return ret_status;
 }
 
 #define ALLOC(type)                                                   \

@@ -1,9 +1,5 @@
 ## Known issues
 
-1. Using IFX_AES_ECB_USE_HARDWARE for the ECB_NO_PADDING and CBC_NO_PADDING
-algorithms (which are not supported by hardware) could cause recursive calls and
-fail as a result. Please use software implementation instead.
-
 Known issues in Mbed TLS are [tracked on GitHub](https://github.com/Mbed-TLS/mbedtls/issues).
 
 ## Reporting a bug
@@ -11,7 +7,7 @@ Known issues in Mbed TLS are [tracked on GitHub](https://github.com/Mbed-TLS/mbe
 If you think you've found a bug in Mbed TLS, please follow these steps:
 
 1. Make sure you're using the latest version of a
-   [maintained branch](BRANCHES.md): `master`, `development`,
+   [maintained branch](BRANCHES.md): `main`, `development`,
    or a long-time support branch.
 2. Check [GitHub](https://github.com/Mbed-TLS/mbedtls/issues) to see if
    your issue has already been reported. If not, …

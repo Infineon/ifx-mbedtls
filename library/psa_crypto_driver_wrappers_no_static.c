@@ -119,9 +119,9 @@ psa_status_t psa_driver_wrapper_get_key_buffer_size(
     const psa_key_attributes_t *attributes,
     size_t *key_buffer_size )
 {
-    psa_key_location_t location = PSA_KEY_LIFETIME_GET_LOCATION( attributes->core.lifetime );
-    psa_key_type_t key_type = attributes->core.type;
-    size_t key_bits = attributes->core.bits;
+    psa_key_location_t location = PSA_KEY_LIFETIME_GET_LOCATION( psa_get_key_lifetime(attributes) );
+    psa_key_type_t key_type = psa_get_key_type(attributes);
+    size_t key_bits = psa_get_key_bits(attributes);
 
     *key_buffer_size = 0;
     switch( location )
@@ -146,7 +146,7 @@ psa_status_t psa_driver_wrapper_get_key_buffer_size(
 #if defined(PSA_CRYPTO_ACCELERATOR_DRIVER_PRESENT)
 #if defined(IFX_PSA_SE_DPA_PRESENT)
         case PSA_KEY_LOCATION_IFX_SE:
-            *key_buffer_size = sizeof( mbedtls_svc_key_id_t );
+            *key_buffer_size = sizeof( ifx_se_key_id_fih_t );
             return( PSA_SUCCESS );
 #endif /* IFX_PSA_SE_DPA_PRESENT */
 #endif /* PSA_CRYPTO_ACCELERATOR_DRIVER_PRESENT */
@@ -174,7 +174,7 @@ psa_status_t psa_driver_wrapper_export_public_key(
     const psa_drv_se_t *drv;
     psa_drv_se_context_t *drv_context;
 
-    if( psa_get_se_driver( attributes->core.lifetime, &drv, &drv_context ) )
+    if( psa_get_se_driver( psa_get_key_lifetime(attributes), &drv, &drv_context ) )
     {
         if( ( drv->key_management == NULL ) ||
             ( drv->key_management->p_export_public == NULL ) )
@@ -273,12 +273,12 @@ psa_status_t psa_driver_wrapper_export_public_key(
 #if defined(IFX_PSA_SE_DPA_PRESENT)
         case PSA_KEY_LOCATION_IFX_SE:
         {
-            mbedtls_svc_key_id_t se_key_id;
+            ifx_se_key_id_fih_t se_key = IFX_SE_KEY_ID_FIH_INIT;
 
-            memcpy(&se_key_id, key_buffer, sizeof(mbedtls_svc_key_id_t));
+            memcpy(&se_key, key_buffer, sizeof(se_key));
 
             return( ifx_se_get_psa_status( ifx_se_export_public_key(
-                        ifx_se_fih_uint_encode(MBEDTLS_SVC_KEY_ID_GET_KEY_ID(se_key_id)),
+                        se_key,
                         ifx_se_fih_ptr_encode(data),
                         ifx_se_fih_uint_encode(data_size),
                         ifx_se_fih_ptr_encode(data_length),
@@ -299,10 +299,10 @@ psa_status_t psa_driver_wrapper_get_builtin_key(
     uint8_t *key_buffer, size_t key_buffer_size, size_t *key_buffer_length )
 {
 
-    psa_key_location_t location = PSA_KEY_LIFETIME_GET_LOCATION( attributes->core.lifetime );
+    psa_key_location_t location = PSA_KEY_LIFETIME_GET_LOCATION( psa_get_key_lifetime(attributes) );
     switch( location )
     {
-#if defined(PSA_CRYPTO_DRIVER_TEST)
+#if defined(PSA_CRYPTO_ACCELERATOR_DRIVER_PRESENT)
 
 #if (defined(PSA_CRYPTO_DRIVER_TEST) )
         case 0x7fffff:
@@ -314,9 +314,6 @@ psa_status_t psa_driver_wrapper_get_builtin_key(
                             key_buffer_length
         ));
 #endif
-
-#endif /* PSA_CRYPTO_DRIVER_TEST */
-#if defined(PSA_CRYPTO_ACCELERATOR_DRIVER_PRESENT)
 #if defined(IFX_PSA_SE_DPA_PRESENT) && defined(IFX_PSA_CRYPTO_BUILTIN_KEYS)
         /* Add cases for opaque driver here */
         case PSA_KEY_LOCATION_IFX_SE:
@@ -335,44 +332,6 @@ psa_status_t psa_driver_wrapper_get_builtin_key(
     }
 
 }
-
-psa_status_t psa_driver_get_tag_len( psa_aead_operation_t *operation,
-                                     uint8_t *tag_len )
-{
-    if( operation == NULL || tag_len == NULL )
-        return( PSA_ERROR_INVALID_ARGUMENT );
-
-#if defined(PSA_CRYPTO_ACCELERATOR_DRIVER_PRESENT)
-#if defined(PSA_CRYPTO_DRIVER_TEST)
-    *tag_len = operation->ctx.transparent_test_driver_ctx.tag_length;
-    return ( PSA_SUCCESS );
-#endif
-#if defined(IFX_PSA_MXCRYPTO_PRESENT) && defined(IFX_PSA_MXCRYPTO_AEAD)
-    if( operation->id == IFX_MXCRYPTO_TRANSPARENT_DRIVER_ID )
-    {
-        *tag_len = operation->ctx.ifx_mxcrypto_ctx.tag_length;
-        return ( PSA_SUCCESS );
-    }
-#endif /* IFX_PSA_MXCRYPTO_PRESENT && IFX_PSA_MXCRYPTO_AEAD */
-#if defined(IFX_PSA_CRYPTOLITE_PRESENT) && defined(IFX_PSA_CRYPTOLITE_AEAD)
-    if( operation->id == IFX_CRYPTOLITE_TRANSPARENT_DRIVER_ID )
-    {
-        *tag_len = operation->ctx.ifx_cryptolite_ctx.tag_length;
-        return ( PSA_SUCCESS );
-    }
-#endif /* IFX_PSA_CRYPTOLITE_PRESENT && IFX_PSA_CRYPTOLITE_AEAD */
-#if defined(IFX_PSA_SE_DPA_PRESENT)
-    if( operation->id == IFX_SE_DPA_DRIVER_ID )
-    {
-        *tag_len = 16U;
-        return ( PSA_SUCCESS );
-    }
-#endif /* IFX_PSA_ENDEAVOURCL_PRESENT */
-#endif
-    *tag_len = operation->ctx.mbedtls_ctx.tag_length;
-    return ( PSA_SUCCESS );
-}
-
 #endif /* MBEDTLS_PSA_CRYPTO_C */
 
 #if defined(PSA_CRYPTO_ACCELERATOR_DRIVER_PRESENT)
@@ -380,37 +339,34 @@ psa_status_t psa_driver_get_tag_len( psa_aead_operation_t *operation,
 void ifx_se_attributes_psa_to_se(const psa_key_attributes_t *attributes, ifx_se_key_attributes_t *se_attributes)
 {
 #if defined(MBEDTLS_PSA_CRYPTO_KEY_ID_ENCODES_OWNER)
-    se_attributes->core.id = MBEDTLS_SVC_KEY_ID_GET_KEY_ID(attributes->core.id);
-    se_attributes->core.type = attributes->core.type;
-    se_attributes->core.bits = attributes->core.bits;
-    se_attributes->core.lifetime = attributes->core.lifetime;
-    se_attributes->core.flags = attributes->core.flags;
-
-    se_attributes->domain_parameters = attributes->domain_parameters;
-    se_attributes->domain_parameters_size = attributes->domain_parameters_size;
-
-    memcpy(&se_attributes->core.policy, &attributes->core.policy, sizeof(psa_key_policy_t));
+    se_attributes->id.key_id = attributes->id.key_id;
+    se_attributes->id.owner  = attributes->id.owner;
 #else
-    memcpy(se_attributes, attributes, sizeof(psa_key_attributes_t));
+    se_attributes->id.key_id = attributes->id;
+    se_attributes->id.owner = 0;
 #endif /* MBEDTLS_PSA_CRYPTO_KEY_ID_ENCODES_OWNER */
+
+    se_attributes->type = attributes->type;
+    se_attributes->bits = attributes->bits;
+    se_attributes->lifetime = attributes->lifetime;
+
+    memcpy(&se_attributes->policy, &attributes->policy, sizeof(psa_key_policy_t));
 }
 
 void ifx_se_attributes_se_to_psa(const ifx_se_key_attributes_t *se_attributes, psa_key_attributes_t *attributes)
 {
 #if defined(MBEDTLS_PSA_CRYPTO_KEY_ID_ENCODES_OWNER)
-    attributes->core.id = mbedtls_svc_key_id_make(0, se_attributes->core.id);
-    attributes->core.type = se_attributes->core.type;
-    attributes->core.bits = se_attributes->core.bits;
-    attributes->core.lifetime = se_attributes->core.lifetime;
-    attributes->core.flags = se_attributes->core.flags;
-
-    attributes->domain_parameters = se_attributes->domain_parameters;
-    attributes->domain_parameters_size = se_attributes->domain_parameters_size;
-
-    memcpy(&attributes->core.policy, &se_attributes->core.policy, sizeof(psa_key_policy_t));
+    attributes->id.key_id = se_attributes->id.key_id;
+    attributes->id.owner  = se_attributes->id.owner;
 #else
-    memcpy(attributes, se_attributes, sizeof(psa_key_attributes_t));
+    attributes->id = se_attributes->id.key_id;
 #endif /* MBEDTLS_PSA_CRYPTO_KEY_ID_ENCODES_OWNER */
+
+    attributes->type = se_attributes->type;
+    attributes->bits = se_attributes->bits;
+    attributes->lifetime = se_attributes->lifetime;
+
+    memcpy(&attributes->policy, &se_attributes->policy, sizeof(psa_key_policy_t));
 }
 #endif /* IFX_PSA_SE_DPA_PRESENT */
 #endif /* PSA_CRYPTO_ACCELERATOR_DRIVER_PRESENT */

@@ -36,10 +36,6 @@ psa_status_t psa_driver_wrapper_get_builtin_key(
     psa_key_attributes_t *attributes,
     uint8_t *key_buffer, size_t key_buffer_size, size_t *key_buffer_length);
 
-psa_status_t psa_driver_get_tag_len(
-    psa_aead_operation_t *operation,
-    uint8_t *tag_len );
-
 #if defined(IFX_PSA_SE_DPA_PRESENT)
 void ifx_se_attributes_psa_to_se(const psa_key_attributes_t *attributes, ifx_se_key_attributes_t *se_attributes);
 void ifx_se_attributes_se_to_psa(const ifx_se_key_attributes_t *se_attributes, psa_key_attributes_t *attributes);

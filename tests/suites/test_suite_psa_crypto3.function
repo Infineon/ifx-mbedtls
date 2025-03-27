@@ -1,0 +1,3431 @@
+/* BEGIN_HEADER */
+#include <stdint.h>
+
+#include "mbedtls/asn1.h"
+#include "mbedtls/asn1write.h"
+#include "mbedtls/oid.h"
+#include "common.h"
+
+/* For MBEDTLS_CTR_DRBG_MAX_REQUEST, knowing that psa_generate_random()
+ * uses mbedtls_ctr_drbg internally. */
+#include "mbedtls/ctr_drbg.h"
+
+#include "psa/crypto.h"
+#include "psa_crypto_slot_management.h"
+
+/* For psa_can_do_hash() */
+#include "psa_crypto_core.h"
+
+#include "test/asn1_helpers.h"
+#include "test/psa_crypto_helpers.h"
+#include "test/psa_exercise_key.h"
+#if defined(PSA_CRYPTO_DRIVER_TEST)
+#include "test/drivers/test_driver.h"
+#define TEST_DRIVER_LOCATION PSA_CRYPTO_TEST_DRIVER_LOCATION
+#else
+#define TEST_DRIVER_LOCATION 0x7fffff
+#endif
+
+/* If this comes up, it's a bug in the test code or in the test data. */
+#define UNUSED 0xdeadbeef
+
+/* Assert that an operation is (not) active.
+ * This serves as a proxy for checking if the operation is aborted. */
+#define ASSERT_OPERATION_IS_ACTIVE(operation) TEST_ASSERT(operation.id != 0)
+#define ASSERT_OPERATION_IS_INACTIVE(operation) TEST_ASSERT(operation.id == 0)
+
+#if defined(PSA_WANT_ALG_JPAKE)
+int ecjpake_operation_setup(psa_pake_operation_t *operation,
+                            psa_pake_cipher_suite_t *cipher_suite,
+                            psa_pake_role_t role,
+                            mbedtls_svc_key_id_t key,
+                            size_t key_available)
+{
+    PSA_ASSERT(psa_pake_abort(operation));
+
+    PSA_ASSERT(psa_pake_setup(operation, cipher_suite));
+
+    PSA_ASSERT(psa_pake_set_role(operation, role));
+
+    if (key_available) {
+        PSA_ASSERT(psa_pake_set_password_key(operation, key));
+    }
+    return 0;
+exit:
+    return 1;
+}
+#endif
+
+/** An invalid export length that will never be set by psa_export_key(). */
+static const size_t INVALID_EXPORT_LENGTH = ~0U;
+
+int exercise_mac_setup(psa_key_type_t key_type,
+                       const unsigned char *key_bytes,
+                       size_t key_length,
+                       psa_algorithm_t alg,
+                       psa_mac_operation_t *operation,
+                       psa_status_t *status)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+    PSA_ASSERT(psa_import_key(&attributes, key_bytes, key_length, &key));
+
+    *status = psa_mac_sign_setup(operation, key, alg);
+    /* Whether setup succeeded or failed, abort must succeed. */
+    PSA_ASSERT(psa_mac_abort(operation));
+    /* If setup failed, reproduce the failure, so that the caller can
+     * test the resulting state of the operation object. */
+    if (*status != PSA_SUCCESS) {
+        TEST_EQUAL(psa_mac_sign_setup(operation, key, alg), *status);
+    }
+
+    psa_destroy_key(key);
+    return 1;
+
+exit:
+    psa_destroy_key(key);
+    return 0;
+}
+
+int exercise_cipher_setup(psa_key_type_t key_type,
+                          const unsigned char *key_bytes,
+                          size_t key_length,
+                          psa_algorithm_t alg,
+                          psa_cipher_operation_t *operation,
+                          psa_status_t *status)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+    PSA_ASSERT(psa_import_key(&attributes, key_bytes, key_length, &key));
+
+    *status = psa_cipher_encrypt_setup(operation, key, alg);
+    /* Whether setup succeeded or failed, abort must succeed. */
+    PSA_ASSERT(psa_cipher_abort(operation));
+    /* If setup failed, reproduce the failure, so that the caller can
+     * test the resulting state of the operation object. */
+    if (*status != PSA_SUCCESS) {
+        TEST_EQUAL(psa_cipher_encrypt_setup(operation, key, alg),
+                   *status);
+    }
+
+    psa_destroy_key(key);
+    return 1;
+
+exit:
+    psa_destroy_key(key);
+    return 0;
+}
+
+static int test_operations_on_invalid_key(mbedtls_svc_key_id_t key)
+{
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    mbedtls_svc_key_id_t key_id = mbedtls_svc_key_id_make(1, 0x6964);
+    uint8_t buffer[1];
+    size_t length;
+    int ok = 0;
+
+    psa_set_key_id(&attributes, key_id);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, PSA_ALG_CTR);
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+    TEST_EQUAL(psa_get_key_attributes(key, &attributes),
+               PSA_ERROR_INVALID_HANDLE);
+    TEST_EQUAL(
+        MBEDTLS_SVC_KEY_ID_GET_KEY_ID(psa_get_key_id(&attributes)), 0);
+    TEST_EQUAL(
+        MBEDTLS_SVC_KEY_ID_GET_OWNER_ID(psa_get_key_id(&attributes)), 0);
+    TEST_EQUAL(psa_get_key_lifetime(&attributes), 0);
+    TEST_EQUAL(psa_get_key_usage_flags(&attributes), 0);
+    TEST_EQUAL(psa_get_key_algorithm(&attributes), 0);
+    TEST_EQUAL(psa_get_key_type(&attributes), 0);
+    TEST_EQUAL(psa_get_key_bits(&attributes), 0);
+
+    TEST_EQUAL(psa_export_key(key, buffer, sizeof(buffer), &length),
+               PSA_ERROR_INVALID_HANDLE);
+    TEST_EQUAL(psa_export_public_key(key,
+                                     buffer, sizeof(buffer), &length),
+               PSA_ERROR_INVALID_HANDLE);
+
+    ok = 1;
+
+exit:
+    /*
+     * Key attributes may have been returned by psa_get_key_attributes()
+     * thus reset them as required.
+     */
+    psa_reset_key_attributes(&attributes);
+
+    return ok;
+}
+
+/* Assert that a key isn't reported as having a slot number. */
+#if defined(MBEDTLS_PSA_CRYPTO_SE_C)
+#define ASSERT_NO_SLOT_NUMBER(attributes)                             \
+    do                                                                  \
+    {                                                                   \
+        psa_key_slot_number_t ASSERT_NO_SLOT_NUMBER_slot_number;        \
+        TEST_EQUAL(psa_get_key_slot_number(                            \
+                       attributes,                                     \
+                       &ASSERT_NO_SLOT_NUMBER_slot_number),           \
+                   PSA_ERROR_INVALID_ARGUMENT);                       \
+    }                                                                   \
+    while (0)
+#else /* MBEDTLS_PSA_CRYPTO_SE_C */
+#define ASSERT_NO_SLOT_NUMBER(attributes)     \
+    ((void) 0)
+#endif /* MBEDTLS_PSA_CRYPTO_SE_C */
+
+#define INPUT_INTEGER 0x10000   /* Out of range of psa_key_type_t */
+
+/* An overapproximation of the amount of storage needed for a key of the
+ * given type and with the given content. The API doesn't make it easy
+ * to find a good value for the size. The current implementation doesn't
+ * care about the value anyway. */
+#define KEY_BITS_FROM_DATA(type, data)        \
+    (data)->len
+
+typedef enum {
+    IMPORT_KEY = 0,
+    GENERATE_KEY = 1,
+    DERIVE_KEY = 2
+} generate_method;
+
+typedef enum {
+    DO_NOT_SET_LENGTHS = 0,
+    SET_LENGTHS_BEFORE_NONCE = 1,
+    SET_LENGTHS_AFTER_NONCE = 2
+} set_lengths_method_t;
+
+typedef enum {
+    USE_NULL_TAG = 0,
+    USE_GIVEN_TAG = 1,
+} tag_usage_method_t;
+
+
+/*!
+ * \brief                           Internal Function for AEAD multipart tests.
+ * \param key_type_arg              Type of key passed in
+ * \param key_data                  The encryption / decryption key data
+ * \param alg_arg                   The type of algorithm used
+ * \param nonce                     Nonce data
+ * \param additional_data           Additional data
+ * \param ad_part_len_arg           If not -1, the length of chunks to
+ *                                  feed additional data in to be encrypted /
+ *                                  decrypted. If -1, no chunking.
+ * \param input_data                Data to encrypt / decrypt
+ * \param data_part_len_arg         If not -1, the length of chunks to feed
+ *                                  the data in to be encrypted / decrypted. If
+ *                                  -1, no chunking
+ * \param set_lengths_method        A member of the set_lengths_method_t enum is
+ *                                  expected here, this controls whether or not
+ *                                  to set lengths, and in what order with
+ *                                  respect to set nonce.
+ * \param expected_output           Expected output
+ * \param is_encrypt                If non-zero this is an encryption operation.
+ * \param do_zero_parts             If non-zero, interleave zero length chunks
+ *                                  with normal length chunks.
+ * \return int                      Zero on failure, non-zero on success.
+ */
+static int aead_multipart_internal_func(int key_type_arg, data_t *key_data,
+                                        int alg_arg,
+                                        data_t *nonce,
+                                        data_t *additional_data,
+                                        int ad_part_len_arg,
+                                        data_t *input_data,
+                                        int data_part_len_arg,
+                                        set_lengths_method_t set_lengths_method,
+                                        data_t *expected_output,
+                                        int is_encrypt,
+                                        int do_zero_parts)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_aead_operation_t operation = PSA_AEAD_OPERATION_INIT;
+    unsigned char *output_data = NULL;
+    unsigned char *part_data = NULL;
+    unsigned char *final_data = NULL;
+    size_t data_true_size = 0;
+    size_t part_data_size = 0;
+    size_t output_size = 0;
+    size_t final_output_size = 0;
+    size_t output_length = 0;
+    size_t key_bits = 0;
+    size_t tag_length = 0;
+    size_t part_offset = 0;
+    size_t part_length = 0;
+    size_t output_part_length = 0;
+    size_t tag_size = 0;
+    size_t ad_part_len = 0;
+    size_t data_part_len = 0;
+    uint8_t tag_buffer[PSA_AEAD_TAG_MAX_SIZE];
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_status_t status = PSA_ERROR_GENERIC_ERROR;
+
+    int test_ok = 0;
+    size_t part_count = 0;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    if (is_encrypt) {
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    } else {
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DECRYPT);
+    }
+
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    PSA_ASSERT(psa_get_key_attributes(key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    tag_length = PSA_AEAD_TAG_LENGTH(key_type, key_bits, alg);
+
+    if (is_encrypt) {
+        /* Tag gets written at end of buffer. */
+        output_size = PSA_AEAD_UPDATE_OUTPUT_SIZE(key_type, alg,
+                                                  (input_data->len +
+                                                   tag_length));
+        data_true_size = input_data->len;
+    } else {
+        output_size = PSA_AEAD_UPDATE_OUTPUT_SIZE(key_type, alg,
+                                                  (input_data->len -
+                                                   tag_length));
+
+        /* Do not want to attempt to decrypt tag. */
+        data_true_size = input_data->len - tag_length;
+    }
+
+    TEST_CALLOC(output_data, output_size);
+
+    if (is_encrypt) {
+        final_output_size = PSA_AEAD_FINISH_OUTPUT_SIZE(key_type, alg);
+        TEST_LE_U(final_output_size, PSA_AEAD_FINISH_OUTPUT_MAX_SIZE);
+    } else {
+        final_output_size = PSA_AEAD_VERIFY_OUTPUT_SIZE(key_type, alg);
+        TEST_LE_U(final_output_size, PSA_AEAD_VERIFY_OUTPUT_MAX_SIZE);
+    }
+
+    TEST_CALLOC(final_data, final_output_size);
+
+    if (is_encrypt) {
+        status = psa_aead_encrypt_setup(&operation, key, alg);
+    } else {
+        status = psa_aead_decrypt_setup(&operation, key, alg);
+    }
+
+    /* If the operation is not supported, just skip and not fail in case the
+     * encryption involves a common limitation of cryptography hardwares and
+     * an alternative implementation. */
+    if (status == PSA_ERROR_NOT_SUPPORTED) {
+        MBEDTLS_TEST_PSA_SKIP_IF_ALT_AES_192(key_type, key_data->len * 8);
+        MBEDTLS_TEST_PSA_SKIP_IF_ALT_GCM_NOT_12BYTES_NONCE(alg, nonce->len);
+    }
+
+    PSA_ASSERT(status);
+
+    if (set_lengths_method ==  DO_NOT_SET_LENGTHS) {
+        PSA_ASSERT(psa_aead_set_nonce(&operation, nonce->x, nonce->len));
+    } else if (set_lengths_method == SET_LENGTHS_BEFORE_NONCE) {
+        PSA_ASSERT(psa_aead_set_lengths(&operation, additional_data->len,
+                                        data_true_size));
+        PSA_ASSERT(psa_aead_set_nonce(&operation, nonce->x, nonce->len));
+    } else if (set_lengths_method ==  SET_LENGTHS_AFTER_NONCE) {
+        PSA_ASSERT(psa_aead_set_nonce(&operation, nonce->x, nonce->len));
+
+        PSA_ASSERT(psa_aead_set_lengths(&operation, additional_data->len,
+                                        data_true_size));
+    }
+
+    if (ad_part_len_arg != -1) {
+        /* Pass additional data in parts */
+        ad_part_len = (size_t) ad_part_len_arg;
+
+        for (part_offset = 0, part_count = 0;
+             part_offset < additional_data->len;
+             part_offset += part_length, part_count++) {
+            if (do_zero_parts && (part_count & 0x01)) {
+                part_length = 0;
+            } else if (additional_data->len - part_offset < ad_part_len) {
+                part_length = additional_data->len - part_offset;
+            } else {
+                part_length = ad_part_len;
+            }
+
+            PSA_ASSERT(psa_aead_update_ad(&operation,
+                                          additional_data->x + part_offset,
+                                          part_length));
+
+        }
+    } else {
+        /* Pass additional data in one go. */
+        PSA_ASSERT(psa_aead_update_ad(&operation, additional_data->x,
+                                      additional_data->len));
+    }
+
+    if (data_part_len_arg != -1) {
+        /* Pass data in parts */
+        data_part_len = (size_t) data_part_len_arg;
+        part_data_size = PSA_AEAD_UPDATE_OUTPUT_SIZE(key_type, alg,
+                                                     (size_t) data_part_len);
+
+        TEST_CALLOC(part_data, part_data_size);
+
+        for (part_offset = 0, part_count = 0;
+             part_offset < data_true_size;
+             part_offset += part_length, part_count++) {
+            if (do_zero_parts && (part_count & 0x01)) {
+                part_length = 0;
+            } else if ((data_true_size - part_offset) < data_part_len) {
+                part_length = (data_true_size - part_offset);
+            } else {
+                part_length = data_part_len;
+            }
+
+            PSA_ASSERT(psa_aead_update(&operation,
+                                       (input_data->x + part_offset),
+                                       part_length, part_data,
+                                       part_data_size,
+                                       &output_part_length));
+
+            if (output_data && output_part_length) {
+                memcpy((output_data + output_length), part_data,
+                       output_part_length);
+            }
+
+            output_length += output_part_length;
+        }
+    } else {
+        /* Pass all data in one go. */
+        PSA_ASSERT(psa_aead_update(&operation, input_data->x,
+                                   data_true_size, output_data,
+                                   output_size, &output_length));
+    }
+
+    if (is_encrypt) {
+        PSA_ASSERT(psa_aead_finish(&operation, final_data,
+                                   final_output_size,
+                                   &output_part_length,
+                                   tag_buffer, tag_length,
+                                   &tag_size));
+    } else {
+        PSA_ASSERT(psa_aead_verify(&operation, final_data,
+                                   final_output_size,
+                                   &output_part_length,
+                                   (input_data->x + data_true_size),
+                                   tag_length));
+    }
+
+    if (output_data && output_part_length) {
+        memcpy((output_data + output_length), final_data,
+               output_part_length);
+    }
+
+    output_length += output_part_length;
+
+
+    /* For all currently defined algorithms, PSA_AEAD_xxx_OUTPUT_SIZE
+     * should be exact.*/
+    if (is_encrypt) {
+        TEST_EQUAL(tag_length, tag_size);
+
+        if (output_data && tag_length) {
+            memcpy((output_data + output_length), tag_buffer,
+                   tag_length);
+        }
+
+        output_length += tag_length;
+
+        TEST_EQUAL(output_length,
+                   PSA_AEAD_ENCRYPT_OUTPUT_SIZE(key_type, alg,
+                                                input_data->len));
+        TEST_LE_U(output_length,
+                  PSA_AEAD_ENCRYPT_OUTPUT_MAX_SIZE(input_data->len));
+    } else {
+        TEST_EQUAL(output_length,
+                   PSA_AEAD_DECRYPT_OUTPUT_SIZE(key_type, alg,
+                                                input_data->len));
+        TEST_LE_U(output_length,
+                  PSA_AEAD_DECRYPT_OUTPUT_MAX_SIZE(input_data->len));
+    }
+
+
+    TEST_MEMORY_COMPARE(expected_output->x, expected_output->len,
+                        output_data, output_length);
+
+
+    test_ok = 1;
+
+exit:
+    psa_destroy_key(key);
+    psa_aead_abort(&operation);
+    mbedtls_free(output_data);
+    mbedtls_free(part_data);
+    mbedtls_free(final_data);
+    PSA_DONE();
+
+    return test_ok;
+}
+
+typedef enum {
+    INJECT_ERR_NONE = 0,
+    INJECT_ERR_UNINITIALIZED_ACCESS,
+    INJECT_ERR_DUPLICATE_SETUP,
+    INJECT_ERR_INVALID_USER,
+    INJECT_ERR_INVALID_PEER,
+    INJECT_ERR_SET_USER,
+    INJECT_ERR_SET_PEER,
+    INJECT_EMPTY_IO_BUFFER,
+    INJECT_UNKNOWN_STEP,
+    INJECT_INVALID_FIRST_STEP,
+    INJECT_WRONG_BUFFER_SIZE,
+    INJECT_VALID_OPERATION_AFTER_FAILURE,
+    INJECT_ANTICIPATE_KEY_DERIVATION_1,
+    INJECT_ANTICIPATE_KEY_DERIVATION_2,
+} ecjpake_injected_failure_t;
+
+#if defined(MBEDTLS_ECP_RESTARTABLE)
+
+static void interruptible_signverify_get_minmax_completes(uint32_t max_ops,
+                                                          psa_status_t expected_status,
+                                                          size_t *min_completes,
+                                                          size_t *max_completes)
+{
+
+    /* This is slightly contrived, but we only really know that with a minimum
+       value of max_ops that a successful operation should take more than one op
+       to complete, and likewise that with a max_ops of
+       PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED, it should complete in one go. */
+    if (max_ops == 0 || max_ops == 1) {
+
+        if (expected_status == PSA_SUCCESS) {
+            *min_completes = 2;
+        } else {
+            *min_completes = 1;
+        }
+
+        *max_completes = PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED;
+    } else {
+        *min_completes = 1;
+        *max_completes = 1;
+    }
+}
+#endif /* MBEDTLS_ECP_RESTARTABLE */
+
+/* END_HEADER */
+
+/* BEGIN_DEPENDENCIES
+ * depends_on:MBEDTLS_PSA_CRYPTO_C
+ * END_DEPENDENCIES
+ */
+
+
+/* BEGIN_CASE */
+void cipher_operation_init()
+{
+    const uint8_t input[1] = { 0 };
+    unsigned char output[1] = { 0 };
+    size_t output_length;
+    /* Test each valid way of initializing the object, except for `= {0}`, as
+     * Clang 5 complains when `-Wmissing-field-initializers` is used, even
+     * though it's OK by the C standard. We could test for this, but we'd need
+     * to suppress the Clang warning for the test. */
+    psa_cipher_operation_t func = psa_cipher_operation_init();
+    psa_cipher_operation_t init = PSA_CIPHER_OPERATION_INIT;
+    psa_cipher_operation_t zero;
+
+    memset(&zero, 0, sizeof(zero));
+
+    /* A freshly-initialized cipher operation should not be usable. */
+    TEST_EQUAL(psa_cipher_update(&func,
+                                 input, sizeof(input),
+                                 output, sizeof(output),
+                                 &output_length),
+               PSA_ERROR_BAD_STATE);
+    TEST_EQUAL(psa_cipher_update(&init,
+                                 input, sizeof(input),
+                                 output, sizeof(output),
+                                 &output_length),
+               PSA_ERROR_BAD_STATE);
+    TEST_EQUAL(psa_cipher_update(&zero,
+                                 input, sizeof(input),
+                                 output, sizeof(output),
+                                 &output_length),
+               PSA_ERROR_BAD_STATE);
+
+    /* A default cipher operation should be abortable without error. */
+    PSA_ASSERT(psa_cipher_abort(&func));
+    PSA_ASSERT(psa_cipher_abort(&init));
+    PSA_ASSERT(psa_cipher_abort(&zero));
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_setup(int key_type_arg,
+                  data_t *key,
+                  int alg_arg,
+                  int expected_status_arg)
+{
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_status_t expected_status = expected_status_arg;
+    psa_cipher_operation_t operation = PSA_CIPHER_OPERATION_INIT;
+    psa_status_t status;
+#if defined(KNOWN_SUPPORTED_CIPHER_ALG)
+    const uint8_t smoke_test_key_data[16] = "kkkkkkkkkkkkkkkk";
+#endif
+
+    PSA_ASSERT(psa_crypto_init());
+
+    if (!exercise_cipher_setup(key_type, key->x, key->len, alg,
+                               &operation, &status)) {
+        goto exit;
+    }
+    TEST_EQUAL(status, expected_status);
+
+    /* The operation object should be reusable. */
+#if defined(KNOWN_SUPPORTED_CIPHER_ALG)
+    if (!exercise_cipher_setup(KNOWN_SUPPORTED_CIPHER_KEY_TYPE,
+                               smoke_test_key_data,
+                               sizeof(smoke_test_key_data),
+                               KNOWN_SUPPORTED_CIPHER_ALG,
+                               &operation, &status)) {
+        goto exit;
+    }
+    TEST_EQUAL(status, PSA_SUCCESS);
+#endif
+
+exit:
+    psa_cipher_abort(&operation);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:PSA_WANT_KEY_TYPE_AES:PSA_WANT_ALG_CBC_PKCS7 */
+void cipher_bad_order()
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = PSA_KEY_TYPE_AES;
+    psa_algorithm_t alg = PSA_ALG_CBC_PKCS7;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_cipher_operation_t operation = PSA_CIPHER_OPERATION_INIT;
+    unsigned char iv[PSA_BLOCK_CIPHER_BLOCK_LENGTH(PSA_KEY_TYPE_AES)] = { 0 };
+    const uint8_t key_data[] = {
+        0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa
+    };
+    const uint8_t text[] = {
+        0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+        0xbb, 0xbb, 0xbb, 0xbb
+    };
+    uint8_t buffer[PSA_BLOCK_CIPHER_BLOCK_LENGTH(PSA_KEY_TYPE_AES)] = { 0 };
+    size_t length = 0;
+
+    PSA_ASSERT(psa_crypto_init());
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT | PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+    PSA_ASSERT(psa_import_key(&attributes, key_data, sizeof(key_data),
+                              &key));
+
+    /* Call encrypt setup twice in a row. */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    ASSERT_OPERATION_IS_ACTIVE(operation);
+    TEST_EQUAL(psa_cipher_encrypt_setup(&operation, key, alg),
+               PSA_ERROR_BAD_STATE);
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+
+    /* Call decrypt setup twice in a row. */
+    PSA_ASSERT(psa_cipher_decrypt_setup(&operation, key, alg));
+    ASSERT_OPERATION_IS_ACTIVE(operation);
+    TEST_EQUAL(psa_cipher_decrypt_setup(&operation, key, alg),
+               PSA_ERROR_BAD_STATE);
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+
+    /* Generate an IV without calling setup beforehand. */
+    TEST_EQUAL(psa_cipher_generate_iv(&operation,
+                                      buffer, sizeof(buffer),
+                                      &length),
+               PSA_ERROR_BAD_STATE);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+
+    /* Generate an IV twice in a row. */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    PSA_ASSERT(psa_cipher_generate_iv(&operation,
+                                      buffer, sizeof(buffer),
+                                      &length));
+    ASSERT_OPERATION_IS_ACTIVE(operation);
+    TEST_EQUAL(psa_cipher_generate_iv(&operation,
+                                      buffer, sizeof(buffer),
+                                      &length),
+               PSA_ERROR_BAD_STATE);
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+
+    /* Generate an IV after it's already set. */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    PSA_ASSERT(psa_cipher_set_iv(&operation,
+                                 iv, sizeof(iv)));
+    TEST_EQUAL(psa_cipher_generate_iv(&operation,
+                                      buffer, sizeof(buffer),
+                                      &length),
+               PSA_ERROR_BAD_STATE);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+
+    /* Set an IV without calling setup beforehand. */
+    TEST_EQUAL(psa_cipher_set_iv(&operation,
+                                 iv, sizeof(iv)),
+               PSA_ERROR_BAD_STATE);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+
+    /* Set an IV after it's already set. */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    PSA_ASSERT(psa_cipher_set_iv(&operation,
+                                 iv, sizeof(iv)));
+    ASSERT_OPERATION_IS_ACTIVE(operation);
+    TEST_EQUAL(psa_cipher_set_iv(&operation,
+                                 iv, sizeof(iv)),
+               PSA_ERROR_BAD_STATE);
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+
+    /* Set an IV after it's already generated. */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    PSA_ASSERT(psa_cipher_generate_iv(&operation,
+                                      buffer, sizeof(buffer),
+                                      &length));
+    TEST_EQUAL(psa_cipher_set_iv(&operation,
+                                 iv, sizeof(iv)),
+               PSA_ERROR_BAD_STATE);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+
+    /* Call update without calling setup beforehand. */
+    TEST_EQUAL(psa_cipher_update(&operation,
+                                 text, sizeof(text),
+                                 buffer, sizeof(buffer),
+                                 &length),
+               PSA_ERROR_BAD_STATE);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+
+    /* Call update without an IV where an IV is required. */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    ASSERT_OPERATION_IS_ACTIVE(operation);
+    TEST_EQUAL(psa_cipher_update(&operation,
+                                 text, sizeof(text),
+                                 buffer, sizeof(buffer),
+                                 &length),
+               PSA_ERROR_BAD_STATE);
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+
+    /* Call update after finish. */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    PSA_ASSERT(psa_cipher_set_iv(&operation,
+                                 iv, sizeof(iv)));
+    PSA_ASSERT(psa_cipher_finish(&operation,
+                                 buffer, sizeof(buffer), &length));
+    TEST_EQUAL(psa_cipher_update(&operation,
+                                 text, sizeof(text),
+                                 buffer, sizeof(buffer),
+                                 &length),
+               PSA_ERROR_BAD_STATE);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+
+    /* Call finish without calling setup beforehand. */
+    TEST_EQUAL(psa_cipher_finish(&operation,
+                                 buffer, sizeof(buffer), &length),
+               PSA_ERROR_BAD_STATE);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+
+    /* Call finish without an IV where an IV is required. */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    /* Not calling update means we are encrypting an empty buffer, which is OK
+     * for cipher modes with padding. */
+    ASSERT_OPERATION_IS_ACTIVE(operation);
+    TEST_EQUAL(psa_cipher_finish(&operation,
+                                 buffer, sizeof(buffer), &length),
+               PSA_ERROR_BAD_STATE);
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+    ASSERT_OPERATION_IS_INACTIVE(operation);
+
+    /* Call finish twice in a row. */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    PSA_ASSERT(psa_cipher_set_iv(&operation,
+                                 iv, sizeof(iv)));
+    PSA_ASSERT(psa_cipher_finish(&operation,
+                                 buffer, sizeof(buffer), &length));
+    TEST_EQUAL(psa_cipher_finish(&operation,
+                                 buffer, sizeof(buffer), &length),
+               PSA_ERROR_BAD_STATE);
+    PSA_ASSERT(psa_cipher_abort(&operation));
+
+    PSA_ASSERT(psa_destroy_key(key));
+
+exit:
+    psa_cipher_abort(&operation);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_encrypt_fail(int alg_arg,
+                         int key_type_arg,
+                         data_t *key_data,
+                         data_t *input,
+                         int expected_status_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_status_t status;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_status_t expected_status = expected_status_arg;
+    unsigned char iv[PSA_CIPHER_IV_MAX_SIZE] = { 0 };
+    size_t iv_size = PSA_CIPHER_IV_MAX_SIZE;
+    size_t iv_length = 0;
+    unsigned char *output = NULL;
+    size_t output_buffer_size = 0;
+    size_t output_length = 0;
+    size_t function_output_length;
+    psa_cipher_operation_t operation = PSA_CIPHER_OPERATION_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    if (PSA_ERROR_BAD_STATE != expected_status) {
+        PSA_ASSERT(psa_crypto_init());
+
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+        psa_set_key_algorithm(&attributes, alg);
+        psa_set_key_type(&attributes, key_type);
+
+        output_buffer_size = PSA_CIPHER_ENCRYPT_OUTPUT_SIZE(key_type, alg,
+                                                            input->len);
+        TEST_CALLOC(output, output_buffer_size);
+
+        PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                                  &key));
+    }
+
+    /* Encrypt, one-shot */
+    status = psa_cipher_encrypt(key, alg, input->x, input->len, output,
+                                output_buffer_size, &output_length);
+
+    TEST_EQUAL(status, expected_status);
+
+    /* Encrypt, multi-part */
+    status = psa_cipher_encrypt_setup(&operation, key, alg);
+    if (status == PSA_SUCCESS) {
+        if (alg != PSA_ALG_ECB_NO_PADDING) {
+            PSA_ASSERT(psa_cipher_generate_iv(&operation,
+                                              iv, iv_size,
+                                              &iv_length));
+        }
+
+        status = psa_cipher_update(&operation, input->x, input->len,
+                                   output, output_buffer_size,
+                                   &function_output_length);
+        if (status == PSA_SUCCESS) {
+            output_length += function_output_length;
+
+            status = psa_cipher_finish(&operation, output + output_length,
+                                       output_buffer_size - output_length,
+                                       &function_output_length);
+
+            TEST_EQUAL(status, expected_status);
+        } else {
+            TEST_EQUAL(status, expected_status);
+        }
+    } else {
+        TEST_EQUAL(status, expected_status);
+    }
+
+exit:
+    psa_cipher_abort(&operation);
+    mbedtls_free(output);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_encrypt_validate_iv_length(int alg, int key_type, data_t *key_data,
+                                       data_t *input, int iv_length,
+                                       int expected_result)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_cipher_operation_t operation = PSA_CIPHER_OPERATION_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    size_t output_buffer_size = 0;
+    unsigned char *output = NULL;
+
+    output_buffer_size = PSA_CIPHER_ENCRYPT_OUTPUT_SIZE(key_type, alg, input->len);
+    TEST_CALLOC(output, output_buffer_size);
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    TEST_EQUAL(expected_result, psa_cipher_set_iv(&operation, output,
+                                                  iv_length));
+
+exit:
+    psa_cipher_abort(&operation);
+    mbedtls_free(output);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_alg_without_iv(int alg_arg, int key_type_arg, data_t *key_data,
+                           data_t *plaintext, data_t *ciphertext)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_cipher_operation_t operation = PSA_CIPHER_OPERATION_INIT;
+    uint8_t iv[1] = { 0x5a };
+    unsigned char *output = NULL;
+    size_t output_buffer_size = 0;
+    size_t output_length, length;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    /* Validate size macros */
+    TEST_LE_U(ciphertext->len,
+              PSA_CIPHER_ENCRYPT_OUTPUT_SIZE(key_type, alg, plaintext->len));
+    TEST_LE_U(PSA_CIPHER_ENCRYPT_OUTPUT_SIZE(key_type, alg, plaintext->len),
+              PSA_CIPHER_ENCRYPT_OUTPUT_MAX_SIZE(plaintext->len));
+    TEST_LE_U(plaintext->len,
+              PSA_CIPHER_DECRYPT_OUTPUT_SIZE(key_type, alg, ciphertext->len));
+    TEST_LE_U(PSA_CIPHER_DECRYPT_OUTPUT_SIZE(key_type, alg, ciphertext->len),
+              PSA_CIPHER_DECRYPT_OUTPUT_MAX_SIZE(ciphertext->len));
+
+
+    /* Set up key and output buffer */
+    psa_set_key_usage_flags(&attributes,
+                            PSA_KEY_USAGE_ENCRYPT | PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+    output_buffer_size = PSA_CIPHER_ENCRYPT_OUTPUT_SIZE(key_type, alg,
+                                                        plaintext->len);
+    TEST_CALLOC(output, output_buffer_size);
+
+    /* set_iv() is not allowed */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    TEST_EQUAL(psa_cipher_set_iv(&operation, iv, sizeof(iv)),
+               PSA_ERROR_BAD_STATE);
+    PSA_ASSERT(psa_cipher_decrypt_setup(&operation, key, alg));
+    TEST_EQUAL(psa_cipher_set_iv(&operation, iv, sizeof(iv)),
+               PSA_ERROR_BAD_STATE);
+
+    /* generate_iv() is not allowed */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    TEST_EQUAL(psa_cipher_generate_iv(&operation, iv, sizeof(iv),
+                                      &length),
+               PSA_ERROR_BAD_STATE);
+    PSA_ASSERT(psa_cipher_decrypt_setup(&operation, key, alg));
+    TEST_EQUAL(psa_cipher_generate_iv(&operation, iv, sizeof(iv),
+                                      &length),
+               PSA_ERROR_BAD_STATE);
+
+    /* Multipart encryption */
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    output_length = 0;
+    length = ~0;
+    PSA_ASSERT(psa_cipher_update(&operation,
+                                 plaintext->x, plaintext->len,
+                                 output, output_buffer_size,
+                                 &length));
+    TEST_LE_U(length, output_buffer_size);
+    output_length += length;
+    PSA_ASSERT(psa_cipher_finish(&operation,
+                                 mbedtls_buffer_offset(output, output_length),
+                                 output_buffer_size - output_length,
+                                 &length));
+    output_length += length;
+    TEST_MEMORY_COMPARE(ciphertext->x, ciphertext->len,
+                        output, output_length);
+
+    /* Multipart encryption */
+    PSA_ASSERT(psa_cipher_decrypt_setup(&operation, key, alg));
+    output_length = 0;
+    length = ~0;
+    PSA_ASSERT(psa_cipher_update(&operation,
+                                 ciphertext->x, ciphertext->len,
+                                 output, output_buffer_size,
+                                 &length));
+    TEST_LE_U(length, output_buffer_size);
+    output_length += length;
+    PSA_ASSERT(psa_cipher_finish(&operation,
+                                 mbedtls_buffer_offset(output, output_length),
+                                 output_buffer_size - output_length,
+                                 &length));
+    output_length += length;
+    TEST_MEMORY_COMPARE(plaintext->x, plaintext->len,
+                        output, output_length);
+
+    /* One-shot encryption */
+    output_length = ~0;
+    PSA_ASSERT(psa_cipher_encrypt(key, alg, plaintext->x, plaintext->len,
+                                  output, output_buffer_size,
+                                  &output_length));
+    TEST_MEMORY_COMPARE(ciphertext->x, ciphertext->len,
+                        output, output_length);
+
+    /* One-shot decryption */
+    output_length = ~0;
+    PSA_ASSERT(psa_cipher_decrypt(key, alg, ciphertext->x, ciphertext->len,
+                                  output, output_buffer_size,
+                                  &output_length));
+    TEST_MEMORY_COMPARE(plaintext->x, plaintext->len,
+                        output, output_length);
+
+exit:
+    PSA_ASSERT(psa_cipher_abort(&operation));
+    mbedtls_free(output);
+    psa_cipher_abort(&operation);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_bad_key(int alg_arg, int key_type_arg, data_t *key_data)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_algorithm_t alg = alg_arg;
+    psa_key_type_t key_type = key_type_arg;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_cipher_operation_t operation = PSA_CIPHER_OPERATION_INIT;
+    psa_status_t status;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    /* Usage of either of these two size macros would cause divide by zero
+     * with incorrect key types previously. Input length should be irrelevant
+     * here. */
+    TEST_EQUAL(PSA_CIPHER_ENCRYPT_OUTPUT_SIZE(key_type, alg, 16),
+               0);
+    TEST_EQUAL(PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type, alg, 16), 0);
+
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    /* Should fail due to invalid alg type (to support invalid key type).
+     * Encrypt or decrypt will end up in the same place. */
+    status = psa_cipher_encrypt_setup(&operation, key, alg);
+
+    TEST_EQUAL(status, PSA_ERROR_INVALID_ARGUMENT);
+
+exit:
+    psa_cipher_abort(&operation);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_encrypt_validation(int alg_arg,
+                               int key_type_arg,
+                               data_t *key_data,
+                               data_t *input)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t iv_size = PSA_CIPHER_IV_LENGTH(key_type, alg);
+    unsigned char *output1 = NULL;
+    size_t output1_buffer_size = 0;
+    size_t output1_length = 0;
+    unsigned char *output2 = NULL;
+    size_t output2_buffer_size = 0;
+    size_t output2_length = 0;
+    size_t function_output_length = 0;
+    psa_cipher_operation_t operation = PSA_CIPHER_OPERATION_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    output1_buffer_size = PSA_CIPHER_ENCRYPT_OUTPUT_SIZE(key_type, alg, input->len);
+    output2_buffer_size = PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type, alg, input->len) +
+                          PSA_CIPHER_FINISH_OUTPUT_SIZE(key_type, alg);
+    TEST_CALLOC(output1, output1_buffer_size);
+    TEST_CALLOC(output2, output2_buffer_size);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    /* The one-shot cipher encryption uses generated iv so validating
+       the output is not possible. Validating with multipart encryption. */
+    PSA_ASSERT(psa_cipher_encrypt(key, alg, input->x, input->len, output1,
+                                  output1_buffer_size, &output1_length));
+    TEST_LE_U(output1_length,
+              PSA_CIPHER_ENCRYPT_OUTPUT_SIZE(key_type, alg, input->len));
+    TEST_LE_U(output1_length,
+              PSA_CIPHER_ENCRYPT_OUTPUT_MAX_SIZE(input->len));
+
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+    PSA_ASSERT(psa_cipher_set_iv(&operation, output1, iv_size));
+
+    PSA_ASSERT(psa_cipher_update(&operation,
+                                 input->x, input->len,
+                                 output2, output2_buffer_size,
+                                 &function_output_length));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type, alg, input->len));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_MAX_SIZE(input->len));
+    output2_length += function_output_length;
+
+    PSA_ASSERT(psa_cipher_finish(&operation,
+                                 output2 + output2_length,
+                                 output2_buffer_size - output2_length,
+                                 &function_output_length));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_FINISH_OUTPUT_SIZE(key_type, alg));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_FINISH_OUTPUT_MAX_SIZE);
+    output2_length += function_output_length;
+
+    PSA_ASSERT(psa_cipher_abort(&operation));
+    TEST_MEMORY_COMPARE(output1 + iv_size, output1_length - iv_size,
+                        output2, output2_length);
+
+exit:
+    psa_cipher_abort(&operation);
+    mbedtls_free(output1);
+    mbedtls_free(output2);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_encrypt_multipart(int alg_arg, int key_type_arg,
+                              data_t *key_data, data_t *iv,
+                              data_t *input,
+                              int first_part_size_arg,
+                              int output1_length_arg, int output2_length_arg,
+                              data_t *expected_output,
+                              int expected_status_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_status_t status;
+    psa_status_t expected_status = expected_status_arg;
+    size_t first_part_size = first_part_size_arg;
+    size_t output1_length = output1_length_arg;
+    size_t output2_length = output2_length_arg;
+    unsigned char *output = NULL;
+    size_t output_buffer_size = 0;
+    size_t function_output_length = 0;
+    size_t total_output_length = 0;
+    psa_cipher_operation_t operation = PSA_CIPHER_OPERATION_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation, key, alg));
+
+    if (iv->len > 0) {
+        PSA_ASSERT(psa_cipher_set_iv(&operation, iv->x, iv->len));
+    }
+
+    output_buffer_size = PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type, alg, input->len) +
+                         PSA_CIPHER_FINISH_OUTPUT_SIZE(key_type, alg);
+    TEST_CALLOC(output, output_buffer_size);
+
+    TEST_LE_U(first_part_size, input->len);
+    PSA_ASSERT(psa_cipher_update(&operation, input->x, first_part_size,
+                                 output, output_buffer_size,
+                                 &function_output_length));
+    TEST_ASSERT(function_output_length == output1_length);
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type, alg, first_part_size));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_MAX_SIZE(first_part_size));
+    total_output_length += function_output_length;
+
+    if (first_part_size < input->len) {
+        PSA_ASSERT(psa_cipher_update(&operation,
+                                     input->x + first_part_size,
+                                     input->len - first_part_size,
+                                     (output_buffer_size == 0 ? NULL :
+                                      output + total_output_length),
+                                     output_buffer_size - total_output_length,
+                                     &function_output_length));
+        TEST_ASSERT(function_output_length == output2_length);
+        TEST_LE_U(function_output_length,
+                  PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type,
+                                                alg,
+                                                input->len - first_part_size));
+        TEST_LE_U(function_output_length,
+                  PSA_CIPHER_UPDATE_OUTPUT_MAX_SIZE(input->len));
+        total_output_length += function_output_length;
+    }
+
+    status = psa_cipher_finish(&operation,
+                               (output_buffer_size == 0 ? NULL :
+                                output + total_output_length),
+                               output_buffer_size - total_output_length,
+                               &function_output_length);
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_FINISH_OUTPUT_SIZE(key_type, alg));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_FINISH_OUTPUT_MAX_SIZE);
+    total_output_length += function_output_length;
+    TEST_EQUAL(status, expected_status);
+
+    if (expected_status == PSA_SUCCESS) {
+        PSA_ASSERT(psa_cipher_abort(&operation));
+
+        TEST_MEMORY_COMPARE(expected_output->x, expected_output->len,
+                            output, total_output_length);
+    }
+
+exit:
+    psa_cipher_abort(&operation);
+    mbedtls_free(output);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_decrypt_multipart(int alg_arg, int key_type_arg,
+                              data_t *key_data, data_t *iv,
+                              data_t *input,
+                              int first_part_size_arg,
+                              int output1_length_arg, int output2_length_arg,
+                              data_t *expected_output,
+                              int expected_status_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_status_t status;
+    psa_status_t expected_status = expected_status_arg;
+    size_t first_part_size = first_part_size_arg;
+    size_t output1_length = output1_length_arg;
+    size_t output2_length = output2_length_arg;
+    unsigned char *output = NULL;
+    size_t output_buffer_size = 0;
+    size_t function_output_length = 0;
+    size_t total_output_length = 0;
+    psa_cipher_operation_t operation = PSA_CIPHER_OPERATION_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    PSA_ASSERT(psa_cipher_decrypt_setup(&operation, key, alg));
+
+    if (iv->len > 0) {
+        PSA_ASSERT(psa_cipher_set_iv(&operation, iv->x, iv->len));
+    }
+
+    output_buffer_size = PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type, alg, input->len) +
+                         PSA_CIPHER_FINISH_OUTPUT_SIZE(key_type, alg);
+    TEST_CALLOC(output, output_buffer_size);
+
+    TEST_LE_U(first_part_size, input->len);
+    PSA_ASSERT(psa_cipher_update(&operation,
+                                 input->x, first_part_size,
+                                 output, output_buffer_size,
+                                 &function_output_length));
+    TEST_ASSERT(function_output_length == output1_length);
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type, alg, first_part_size));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_MAX_SIZE(first_part_size));
+    total_output_length += function_output_length;
+
+    if (first_part_size < input->len) {
+        PSA_ASSERT(psa_cipher_update(&operation,
+                                     input->x + first_part_size,
+                                     input->len - first_part_size,
+                                     (output_buffer_size == 0 ? NULL :
+                                      output + total_output_length),
+                                     output_buffer_size - total_output_length,
+                                     &function_output_length));
+        TEST_ASSERT(function_output_length == output2_length);
+        TEST_LE_U(function_output_length,
+                  PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type,
+                                                alg,
+                                                input->len - first_part_size));
+        TEST_LE_U(function_output_length,
+                  PSA_CIPHER_UPDATE_OUTPUT_MAX_SIZE(input->len));
+        total_output_length += function_output_length;
+    }
+
+    status = psa_cipher_finish(&operation,
+                               (output_buffer_size == 0 ? NULL :
+                                output + total_output_length),
+                               output_buffer_size - total_output_length,
+                               &function_output_length);
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_FINISH_OUTPUT_SIZE(key_type, alg));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_FINISH_OUTPUT_MAX_SIZE);
+    total_output_length += function_output_length;
+    TEST_EQUAL(status, expected_status);
+
+    if (expected_status == PSA_SUCCESS) {
+        PSA_ASSERT(psa_cipher_abort(&operation));
+
+        TEST_MEMORY_COMPARE(expected_output->x, expected_output->len,
+                            output, total_output_length);
+    }
+
+exit:
+    psa_cipher_abort(&operation);
+    mbedtls_free(output);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_decrypt_fail(int alg_arg,
+                         int key_type_arg,
+                         data_t *key_data,
+                         data_t *iv,
+                         data_t *input_arg,
+                         int expected_status_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_status_t status;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_status_t expected_status = expected_status_arg;
+    unsigned char *input = NULL;
+    size_t input_buffer_size = 0;
+    unsigned char *output = NULL;
+    unsigned char *output_multi = NULL;
+    size_t output_buffer_size = 0;
+    size_t output_length = 0;
+    size_t function_output_length;
+    psa_cipher_operation_t operation = PSA_CIPHER_OPERATION_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    if (PSA_ERROR_BAD_STATE != expected_status) {
+        PSA_ASSERT(psa_crypto_init());
+
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DECRYPT);
+        psa_set_key_algorithm(&attributes, alg);
+        psa_set_key_type(&attributes, key_type);
+
+        PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                                  &key));
+    }
+
+    /* Allocate input buffer and copy the iv and the plaintext */
+    input_buffer_size = ((size_t) input_arg->len + (size_t) iv->len);
+    if (input_buffer_size > 0) {
+        TEST_CALLOC(input, input_buffer_size);
+        memcpy(input, iv->x, iv->len);
+        memcpy(input + iv->len, input_arg->x, input_arg->len);
+    }
+
+    output_buffer_size = PSA_CIPHER_DECRYPT_OUTPUT_SIZE(key_type, alg, input_buffer_size);
+    TEST_CALLOC(output, output_buffer_size);
+
+    /* Decrypt, one-short */
+    status = psa_cipher_decrypt(key, alg, input, input_buffer_size, output,
+                                output_buffer_size, &output_length);
+    TEST_EQUAL(status, expected_status);
+
+    /* Decrypt, multi-part */
+    status = psa_cipher_decrypt_setup(&operation, key, alg);
+    if (status == PSA_SUCCESS) {
+        output_buffer_size = PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type, alg,
+                                                           input_arg->len) +
+                             PSA_CIPHER_FINISH_OUTPUT_SIZE(key_type, alg);
+        TEST_CALLOC(output_multi, output_buffer_size);
+
+        if (iv->len > 0) {
+            status = psa_cipher_set_iv(&operation, iv->x, iv->len);
+
+            if (status != PSA_SUCCESS) {
+                TEST_EQUAL(status, expected_status);
+            }
+        }
+
+        if (status == PSA_SUCCESS) {
+            status = psa_cipher_update(&operation,
+                                       input_arg->x, input_arg->len,
+                                       output_multi, output_buffer_size,
+                                       &function_output_length);
+            if (status == PSA_SUCCESS) {
+                output_length = function_output_length;
+
+                status = psa_cipher_finish(&operation,
+                                           output_multi + output_length,
+                                           output_buffer_size - output_length,
+                                           &function_output_length);
+
+                TEST_EQUAL(status, expected_status);
+            } else {
+                TEST_EQUAL(status, expected_status);
+            }
+        } else {
+            TEST_EQUAL(status, expected_status);
+        }
+    } else {
+        TEST_EQUAL(status, expected_status);
+    }
+
+exit:
+    psa_cipher_abort(&operation);
+    mbedtls_free(input);
+    mbedtls_free(output);
+    mbedtls_free(output_multi);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_decrypt(int alg_arg,
+                    int key_type_arg,
+                    data_t *key_data,
+                    data_t *iv,
+                    data_t *input_arg,
+                    data_t *expected_output)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    unsigned char *input = NULL;
+    size_t input_buffer_size = 0;
+    unsigned char *output = NULL;
+    size_t output_buffer_size = 0;
+    size_t output_length = 0;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    /* Allocate input buffer and copy the iv and the plaintext */
+    input_buffer_size = ((size_t) input_arg->len + (size_t) iv->len);
+    if (input_buffer_size > 0) {
+        TEST_CALLOC(input, input_buffer_size);
+        memcpy(input, iv->x, iv->len);
+        memcpy(input + iv->len, input_arg->x, input_arg->len);
+    }
+
+    output_buffer_size = PSA_CIPHER_DECRYPT_OUTPUT_SIZE(key_type, alg, input_buffer_size);
+    TEST_CALLOC(output, output_buffer_size);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    PSA_ASSERT(psa_cipher_decrypt(key, alg, input, input_buffer_size, output,
+                                  output_buffer_size, &output_length));
+    TEST_LE_U(output_length,
+              PSA_CIPHER_DECRYPT_OUTPUT_SIZE(key_type, alg, input_buffer_size));
+    TEST_LE_U(output_length,
+              PSA_CIPHER_DECRYPT_OUTPUT_MAX_SIZE(input_buffer_size));
+
+    TEST_MEMORY_COMPARE(expected_output->x, expected_output->len,
+                        output, output_length);
+exit:
+    mbedtls_free(input);
+    mbedtls_free(output);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_verify_output(int alg_arg,
+                          int key_type_arg,
+                          data_t *key_data,
+                          data_t *input)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    unsigned char *output1 = NULL;
+    size_t output1_size = 0;
+    size_t output1_length = 0;
+    unsigned char *output2 = NULL;
+    size_t output2_size = 0;
+    size_t output2_length = 0;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT | PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+    output1_size = PSA_CIPHER_ENCRYPT_OUTPUT_SIZE(key_type, alg, input->len);
+    TEST_CALLOC(output1, output1_size);
+
+    PSA_ASSERT(psa_cipher_encrypt(key, alg, input->x, input->len,
+                                  output1, output1_size,
+                                  &output1_length));
+    TEST_LE_U(output1_length,
+              PSA_CIPHER_ENCRYPT_OUTPUT_SIZE(key_type, alg, input->len));
+    TEST_LE_U(output1_length,
+              PSA_CIPHER_ENCRYPT_OUTPUT_MAX_SIZE(input->len));
+
+    output2_size = output1_length;
+    TEST_CALLOC(output2, output2_size);
+
+    PSA_ASSERT(psa_cipher_decrypt(key, alg, output1, output1_length,
+                                  output2, output2_size,
+                                  &output2_length));
+    TEST_LE_U(output2_length,
+              PSA_CIPHER_DECRYPT_OUTPUT_SIZE(key_type, alg, output1_length));
+    TEST_LE_U(output2_length,
+              PSA_CIPHER_DECRYPT_OUTPUT_MAX_SIZE(output1_length));
+
+    TEST_MEMORY_COMPARE(input->x, input->len, output2, output2_length);
+
+exit:
+    mbedtls_free(output1);
+    mbedtls_free(output2);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void cipher_verify_output_multipart(int alg_arg,
+                                    int key_type_arg,
+                                    data_t *key_data,
+                                    data_t *input,
+                                    int first_part_size_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t first_part_size = first_part_size_arg;
+    unsigned char iv[16] = { 0 };
+    size_t iv_size = 16;
+    size_t iv_length = 0;
+    unsigned char *output1 = NULL;
+    size_t output1_buffer_size = 0;
+    size_t output1_length = 0;
+    unsigned char *output2 = NULL;
+    size_t output2_buffer_size = 0;
+    size_t output2_length = 0;
+    size_t function_output_length;
+    psa_cipher_operation_t operation1 = PSA_CIPHER_OPERATION_INIT;
+    psa_cipher_operation_t operation2 = PSA_CIPHER_OPERATION_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT | PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    PSA_ASSERT(psa_cipher_encrypt_setup(&operation1, key, alg));
+    PSA_ASSERT(psa_cipher_decrypt_setup(&operation2, key, alg));
+
+    if (alg != PSA_ALG_ECB_NO_PADDING) {
+        PSA_ASSERT(psa_cipher_generate_iv(&operation1,
+                                          iv, iv_size,
+                                          &iv_length));
+    }
+
+    output1_buffer_size = PSA_CIPHER_ENCRYPT_OUTPUT_SIZE(key_type, alg, input->len);
+    TEST_LE_U(output1_buffer_size,
+              PSA_CIPHER_ENCRYPT_OUTPUT_MAX_SIZE(input->len));
+    TEST_CALLOC(output1, output1_buffer_size);
+
+    TEST_LE_U(first_part_size, input->len);
+
+    PSA_ASSERT(psa_cipher_update(&operation1, input->x, first_part_size,
+                                 output1, output1_buffer_size,
+                                 &function_output_length));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type, alg, first_part_size));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_MAX_SIZE(first_part_size));
+    output1_length += function_output_length;
+
+    PSA_ASSERT(psa_cipher_update(&operation1,
+                                 input->x + first_part_size,
+                                 input->len - first_part_size,
+                                 output1 + output1_length,
+                                 output1_buffer_size - output1_length,
+                                 &function_output_length));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type,
+                                            alg,
+                                            input->len - first_part_size));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_MAX_SIZE(input->len - first_part_size));
+    output1_length += function_output_length;
+
+    PSA_ASSERT(psa_cipher_finish(&operation1,
+                                 output1 + output1_length,
+                                 output1_buffer_size - output1_length,
+                                 &function_output_length));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_FINISH_OUTPUT_SIZE(key_type, alg));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_FINISH_OUTPUT_MAX_SIZE);
+    output1_length += function_output_length;
+
+    PSA_ASSERT(psa_cipher_abort(&operation1));
+
+    output2_buffer_size = output1_length;
+    TEST_LE_U(output2_buffer_size,
+              PSA_CIPHER_DECRYPT_OUTPUT_SIZE(key_type, alg, output1_length));
+    TEST_LE_U(output2_buffer_size,
+              PSA_CIPHER_DECRYPT_OUTPUT_MAX_SIZE(output1_length));
+    TEST_CALLOC(output2, output2_buffer_size);
+
+    if (iv_length > 0) {
+        PSA_ASSERT(psa_cipher_set_iv(&operation2,
+                                     iv, iv_length));
+    }
+
+    PSA_ASSERT(psa_cipher_update(&operation2, output1, first_part_size,
+                                 output2, output2_buffer_size,
+                                 &function_output_length));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type, alg, first_part_size));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_MAX_SIZE(first_part_size));
+    output2_length += function_output_length;
+
+    PSA_ASSERT(psa_cipher_update(&operation2,
+                                 output1 + first_part_size,
+                                 output1_length - first_part_size,
+                                 output2 + output2_length,
+                                 output2_buffer_size - output2_length,
+                                 &function_output_length));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_SIZE(key_type,
+                                            alg,
+                                            output1_length - first_part_size));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_UPDATE_OUTPUT_MAX_SIZE(output1_length - first_part_size));
+    output2_length += function_output_length;
+
+    PSA_ASSERT(psa_cipher_finish(&operation2,
+                                 output2 + output2_length,
+                                 output2_buffer_size - output2_length,
+                                 &function_output_length));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_FINISH_OUTPUT_SIZE(key_type, alg));
+    TEST_LE_U(function_output_length,
+              PSA_CIPHER_FINISH_OUTPUT_MAX_SIZE);
+    output2_length += function_output_length;
+
+    PSA_ASSERT(psa_cipher_abort(&operation2));
+
+    TEST_MEMORY_COMPARE(input->x, input->len, output2, output2_length);
+
+exit:
+    psa_cipher_abort(&operation1);
+    psa_cipher_abort(&operation2);
+    mbedtls_free(output1);
+    mbedtls_free(output2);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+
+/* BEGIN_CASE */
+void sign_hash_deterministic(int key_type_arg, data_t *key_data,
+                             int alg_arg, data_t *input_data,
+                             data_t *output_data)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t key_bits;
+    unsigned char *signature = NULL;
+    size_t signature_size;
+    size_t signature_length = 0xdeadbeef;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+    PSA_ASSERT(psa_get_key_attributes(key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    /* Allocate a buffer which has the size advertised by the
+     * library. */
+    signature_size = PSA_SIGN_OUTPUT_SIZE(key_type,
+                                          key_bits, alg);
+    TEST_ASSERT(signature_size != 0);
+    TEST_LE_U(signature_size, PSA_SIGNATURE_MAX_SIZE);
+    TEST_CALLOC(signature, signature_size);
+
+    /* Perform the signature. */
+    PSA_ASSERT(psa_sign_hash(key, alg,
+                             input_data->x, input_data->len,
+                             signature, signature_size,
+                             &signature_length));
+    /* Verify that the signature is what is expected. */
+    TEST_MEMORY_COMPARE(output_data->x, output_data->len,
+                        signature, signature_length);
+
+exit:
+    /*
+     * Key attributes may have been returned by psa_get_key_attributes()
+     * thus reset them as required.
+     */
+    psa_reset_key_attributes(&attributes);
+
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:MBEDTLS_ECP_RESTARTABLE */
+/**
+ * sign_hash_interruptible() test intentions:
+ *
+ * Note: This test can currently only handle ECDSA.
+ *
+ * 1. Test interruptible sign hash with known outcomes (deterministic ECDSA
+ *    and private keys / keypairs only).
+ *
+ * 2. Test the number of calls to psa_sign_hash_complete() required are as
+ *    expected for different max_ops values.
+ *
+ * 3. Test that the number of ops done prior to start and after abort is zero
+ *    and that each successful stage completes some ops (this is not mandated by
+ *    the PSA specification, but is currently the case).
+ *
+ * 4. Test that calling psa_sign_hash_get_num_ops() multiple times between
+ *    complete() calls does not alter the number of ops returned.
+ */
+void sign_hash_interruptible(int key_type_arg, data_t *key_data,
+                             int alg_arg, data_t *input_data,
+                             data_t *output_data, int max_ops_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t key_bits;
+    unsigned char *signature = NULL;
+    size_t signature_size;
+    size_t signature_length = 0xdeadbeef;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_status_t status = PSA_OPERATION_INCOMPLETE;
+    uint32_t num_ops = 0;
+    uint32_t max_ops = max_ops_arg;
+    size_t num_ops_prior = 0;
+    size_t num_completes = 0;
+    size_t min_completes = 0;
+    size_t max_completes = 0;
+
+    psa_sign_hash_interruptible_operation_t operation =
+        psa_sign_hash_interruptible_operation_init();
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+    PSA_ASSERT(psa_get_key_attributes(key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    /* Allocate a buffer which has the size advertised by the
+     * library. */
+    signature_size = PSA_SIGN_OUTPUT_SIZE(key_type,
+                                          key_bits, alg);
+    TEST_ASSERT(signature_size != 0);
+    TEST_LE_U(signature_size, PSA_SIGNATURE_MAX_SIZE);
+    TEST_CALLOC(signature, signature_size);
+
+    psa_interruptible_set_max_ops(max_ops);
+
+    interruptible_signverify_get_minmax_completes(max_ops, PSA_SUCCESS,
+                                                  &min_completes, &max_completes);
+
+    num_ops_prior = psa_sign_hash_get_num_ops(&operation);
+    TEST_ASSERT(num_ops_prior == 0);
+
+    /* Start performing the signature. */
+    PSA_ASSERT(psa_sign_hash_start(&operation, key, alg,
+                                   input_data->x, input_data->len));
+
+    num_ops_prior = psa_sign_hash_get_num_ops(&operation);
+    TEST_ASSERT(num_ops_prior == 0);
+
+    /* Continue performing the signature until complete. */
+    do {
+        status = psa_sign_hash_complete(&operation, signature, signature_size,
+                                        &signature_length);
+
+        num_completes++;
+
+        if (status == PSA_SUCCESS || status == PSA_OPERATION_INCOMPLETE) {
+            num_ops = psa_sign_hash_get_num_ops(&operation);
+            /* We are asserting here that every complete makes progress
+             * (completes some ops), which is true of the internal
+             * implementation and probably any implementation, however this is
+             * not mandated by the PSA specification. */
+            TEST_ASSERT(num_ops > num_ops_prior);
+
+            num_ops_prior = num_ops;
+
+            /* Ensure calling get_num_ops() twice still returns the same
+             * number of ops as previously reported. */
+            num_ops = psa_sign_hash_get_num_ops(&operation);
+
+            TEST_EQUAL(num_ops, num_ops_prior);
+        }
+    } while (status == PSA_OPERATION_INCOMPLETE);
+
+    TEST_ASSERT(status == PSA_SUCCESS);
+
+    TEST_LE_U(min_completes, num_completes);
+    TEST_LE_U(num_completes, max_completes);
+
+    /* Verify that the signature is what is expected. */
+    TEST_MEMORY_COMPARE(output_data->x, output_data->len,
+                        signature, signature_length);
+
+    PSA_ASSERT(psa_sign_hash_abort(&operation));
+
+    num_ops = psa_sign_hash_get_num_ops(&operation);
+    TEST_ASSERT(num_ops == 0);
+
+exit:
+
+    /*
+     * Key attributes may have been returned by psa_get_key_attributes()
+     * thus reset them as required.
+     */
+    psa_reset_key_attributes(&attributes);
+
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void sign_hash_fail(int key_type_arg, data_t *key_data,
+                    int alg_arg, data_t *input_data,
+                    int signature_size_arg, int expected_status_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t signature_size = signature_size_arg;
+    psa_status_t actual_status;
+    psa_status_t expected_status = expected_status_arg;
+    unsigned char *signature = NULL;
+    size_t signature_length = 0xdeadbeef;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    TEST_CALLOC(signature, signature_size);
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    actual_status = psa_sign_hash(key, alg,
+                                  input_data->x, input_data->len,
+                                  signature, signature_size,
+                                  &signature_length);
+    TEST_EQUAL(actual_status, expected_status);
+    /* The value of *signature_length is unspecified on error, but
+     * whatever it is, it should be less than signature_size, so that
+     * if the caller tries to read *signature_length bytes without
+     * checking the error code then they don't overflow a buffer. */
+    TEST_LE_U(signature_length, signature_size);
+
+exit:
+    psa_reset_key_attributes(&attributes);
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:MBEDTLS_ECP_RESTARTABLE */
+/**
+ * sign_hash_fail_interruptible() test intentions:
+ *
+ * Note: This test can currently only handle ECDSA.
+ *
+ * 1. Test that various failure cases for interruptible sign hash fail with the
+ *    correct error codes, and at the correct point (at start or during
+ *    complete).
+ *
+ * 2. Test the number of calls to psa_sign_hash_complete() required are as
+ *    expected for different max_ops values.
+ *
+ * 3. Test that the number of ops done prior to start and after abort is zero
+ *    and that each successful stage completes some ops (this is not mandated by
+ *    the PSA specification, but is currently the case).
+ *
+ * 4. Check that calling complete() when start() fails and complete()
+ *    after completion results in a BAD_STATE error.
+ *
+ * 5. Check that calling start() again after start fails results in a BAD_STATE
+ *    error.
+ */
+void sign_hash_fail_interruptible(int key_type_arg, data_t *key_data,
+                                  int alg_arg, data_t *input_data,
+                                  int signature_size_arg,
+                                  int expected_start_status_arg,
+                                  int expected_complete_status_arg,
+                                  int max_ops_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t signature_size = signature_size_arg;
+    psa_status_t actual_status;
+    psa_status_t expected_start_status = expected_start_status_arg;
+    psa_status_t expected_complete_status = expected_complete_status_arg;
+    unsigned char *signature = NULL;
+    size_t signature_length = 0xdeadbeef;
+    uint32_t num_ops = 0;
+    uint32_t max_ops = max_ops_arg;
+    size_t num_ops_prior = 0;
+    size_t num_completes = 0;
+    size_t min_completes = 0;
+    size_t max_completes = 0;
+
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_sign_hash_interruptible_operation_t operation =
+        psa_sign_hash_interruptible_operation_init();
+
+    TEST_CALLOC(signature, signature_size);
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    psa_interruptible_set_max_ops(max_ops);
+
+    interruptible_signverify_get_minmax_completes(max_ops,
+                                                  expected_complete_status,
+                                                  &min_completes,
+                                                  &max_completes);
+
+    num_ops_prior = psa_sign_hash_get_num_ops(&operation);
+    TEST_ASSERT(num_ops_prior == 0);
+
+    /* Start performing the signature. */
+    actual_status = psa_sign_hash_start(&operation, key, alg,
+                                        input_data->x, input_data->len);
+
+    TEST_EQUAL(actual_status, expected_start_status);
+
+    if (expected_start_status != PSA_SUCCESS) {
+        /* Emulate poor application code, and call complete anyway, even though
+         * start failed. */
+        actual_status = psa_sign_hash_complete(&operation, signature,
+                                               signature_size,
+                                               &signature_length);
+
+        TEST_EQUAL(actual_status, PSA_ERROR_BAD_STATE);
+
+        /* Test that calling start again after failure also causes BAD_STATE. */
+        actual_status = psa_sign_hash_start(&operation, key, alg,
+                                            input_data->x, input_data->len);
+
+        TEST_EQUAL(actual_status, PSA_ERROR_BAD_STATE);
+    }
+
+    num_ops_prior = psa_sign_hash_get_num_ops(&operation);
+    TEST_ASSERT(num_ops_prior == 0);
+
+    /* Continue performing the signature until complete. */
+    do {
+        actual_status = psa_sign_hash_complete(&operation, signature,
+                                               signature_size,
+                                               &signature_length);
+
+        num_completes++;
+
+        if (actual_status == PSA_SUCCESS ||
+            actual_status == PSA_OPERATION_INCOMPLETE) {
+            num_ops = psa_sign_hash_get_num_ops(&operation);
+            /* We are asserting here that every complete makes progress
+             * (completes some ops), which is true of the internal
+             * implementation and probably any implementation, however this is
+             * not mandated by the PSA specification. */
+            TEST_ASSERT(num_ops > num_ops_prior);
+
+            num_ops_prior = num_ops;
+        }
+    } while (actual_status == PSA_OPERATION_INCOMPLETE);
+
+    TEST_EQUAL(actual_status, expected_complete_status);
+
+    /* Check that another complete returns BAD_STATE. */
+    actual_status = psa_sign_hash_complete(&operation, signature,
+                                           signature_size,
+                                           &signature_length);
+
+    TEST_EQUAL(actual_status, PSA_ERROR_BAD_STATE);
+
+    PSA_ASSERT(psa_sign_hash_abort(&operation));
+
+    num_ops = psa_sign_hash_get_num_ops(&operation);
+    TEST_ASSERT(num_ops == 0);
+
+    /* The value of *signature_length is unspecified on error, but
+     * whatever it is, it should be less than signature_size, so that
+     * if the caller tries to read *signature_length bytes without
+     * checking the error code then they don't overflow a buffer. */
+    TEST_LE_U(signature_length, signature_size);
+
+    TEST_LE_U(min_completes, num_completes);
+    TEST_LE_U(num_completes, max_completes);
+
+exit:
+    psa_reset_key_attributes(&attributes);
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void sign_verify_hash(int key_type_arg, data_t *key_data,
+                      int alg_arg, data_t *input_data)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t key_bits;
+    unsigned char *signature = NULL;
+    size_t signature_size;
+    size_t signature_length = 0xdeadbeef;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_VERIFY_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+    PSA_ASSERT(psa_get_key_attributes(key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    /* Allocate a buffer which has the size advertised by the
+     * library. */
+    signature_size = PSA_SIGN_OUTPUT_SIZE(key_type,
+                                          key_bits, alg);
+    TEST_ASSERT(signature_size != 0);
+    TEST_LE_U(signature_size, PSA_SIGNATURE_MAX_SIZE);
+    TEST_CALLOC(signature, signature_size);
+
+    /* Perform the signature. */
+    PSA_ASSERT(psa_sign_hash(key, alg,
+                             input_data->x, input_data->len,
+                             signature, signature_size,
+                             &signature_length));
+    /* Check that the signature length looks sensible. */
+    TEST_LE_U(signature_length, signature_size);
+    TEST_ASSERT(signature_length > 0);
+
+    /* Use the library to verify that the signature is correct. */
+    PSA_ASSERT(psa_verify_hash(key, alg,
+                               input_data->x, input_data->len,
+                               signature, signature_length));
+
+    if (input_data->len != 0) {
+        /* Flip a bit in the input and verify that the signature is now
+         * detected as invalid. Flip a bit at the beginning, not at the end,
+         * because ECDSA may ignore the last few bits of the input. */
+        input_data->x[0] ^= 1;
+        TEST_EQUAL(psa_verify_hash(key, alg,
+                                   input_data->x, input_data->len,
+                                   signature, signature_length),
+                   PSA_ERROR_INVALID_SIGNATURE);
+    }
+
+exit:
+    /*
+     * Key attributes may have been returned by psa_get_key_attributes()
+     * thus reset them as required.
+     */
+    psa_reset_key_attributes(&attributes);
+
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:MBEDTLS_ECP_RESTARTABLE */
+/**
+ * sign_verify_hash_interruptible() test intentions:
+ *
+ * Note: This test can currently only handle ECDSA.
+ *
+ * 1. Test that we can sign an input hash with the given keypair and then
+ *    afterwards verify that signature. This is currently the only way to test
+ *    non deterministic ECDSA, but this test can also handle deterministic.
+ *
+ * 2. Test that after corrupting the hash, the verification detects an invalid
+ *    signature.
+ *
+ * 3. Test the number of calls to psa_sign_hash_complete() required are as
+ *    expected for different max_ops values.
+ *
+ * 4. Test that the number of ops done prior to starting signing and after abort
+ *    is zero and that each successful signing stage completes some ops (this is
+ *    not mandated by the PSA specification, but is currently the case).
+ */
+void sign_verify_hash_interruptible(int key_type_arg, data_t *key_data,
+                                    int alg_arg, data_t *input_data,
+                                    int max_ops_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t key_bits;
+    unsigned char *signature = NULL;
+    size_t signature_size;
+    size_t signature_length = 0xdeadbeef;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_status_t status = PSA_OPERATION_INCOMPLETE;
+    uint32_t max_ops = max_ops_arg;
+    uint32_t num_ops = 0;
+    uint32_t num_ops_prior = 0;
+    size_t num_completes = 0;
+    size_t min_completes = 0;
+    size_t max_completes = 0;
+
+    psa_sign_hash_interruptible_operation_t sign_operation =
+        psa_sign_hash_interruptible_operation_init();
+    psa_verify_hash_interruptible_operation_t verify_operation =
+        psa_verify_hash_interruptible_operation_init();
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH |
+                            PSA_KEY_USAGE_VERIFY_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+    PSA_ASSERT(psa_get_key_attributes(key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    /* Allocate a buffer which has the size advertised by the
+     * library. */
+    signature_size = PSA_SIGN_OUTPUT_SIZE(key_type,
+                                          key_bits, alg);
+    TEST_ASSERT(signature_size != 0);
+    TEST_LE_U(signature_size, PSA_SIGNATURE_MAX_SIZE);
+    TEST_CALLOC(signature, signature_size);
+
+    psa_interruptible_set_max_ops(max_ops);
+
+    interruptible_signverify_get_minmax_completes(max_ops, PSA_SUCCESS,
+                                                  &min_completes, &max_completes);
+
+    num_ops_prior = psa_sign_hash_get_num_ops(&sign_operation);
+    TEST_ASSERT(num_ops_prior == 0);
+
+    /* Start performing the signature. */
+    PSA_ASSERT(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_data->x, input_data->len));
+
+    num_ops_prior = psa_sign_hash_get_num_ops(&sign_operation);
+    TEST_ASSERT(num_ops_prior == 0);
+
+    /* Continue performing the signature until complete. */
+    do {
+
+        status = psa_sign_hash_complete(&sign_operation, signature,
+                                        signature_size,
+                                        &signature_length);
+
+        num_completes++;
+
+        if (status == PSA_SUCCESS || status == PSA_OPERATION_INCOMPLETE) {
+            num_ops = psa_sign_hash_get_num_ops(&sign_operation);
+            /* We are asserting here that every complete makes progress
+             * (completes some ops), which is true of the internal
+             * implementation and probably any implementation, however this is
+             * not mandated by the PSA specification. */
+            TEST_ASSERT(num_ops > num_ops_prior);
+
+            num_ops_prior = num_ops;
+        }
+    } while (status == PSA_OPERATION_INCOMPLETE);
+
+    TEST_ASSERT(status == PSA_SUCCESS);
+
+    TEST_LE_U(min_completes, num_completes);
+    TEST_LE_U(num_completes, max_completes);
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    num_ops = psa_sign_hash_get_num_ops(&sign_operation);
+    TEST_ASSERT(num_ops == 0);
+
+    /* Check that the signature length looks sensible. */
+    TEST_LE_U(signature_length, signature_size);
+    TEST_ASSERT(signature_length > 0);
+
+    num_completes = 0;
+
+    /* Start verification. */
+    PSA_ASSERT(psa_verify_hash_start(&verify_operation, key, alg,
+                                     input_data->x, input_data->len,
+                                     signature, signature_length));
+
+    /* Continue performing the signature until complete. */
+    do {
+        status = psa_verify_hash_complete(&verify_operation);
+
+        num_completes++;
+    } while (status == PSA_OPERATION_INCOMPLETE);
+
+    TEST_ASSERT(status == PSA_SUCCESS);
+
+    TEST_LE_U(min_completes, num_completes);
+    TEST_LE_U(num_completes, max_completes);
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+    verify_operation = psa_verify_hash_interruptible_operation_init();
+
+    if (input_data->len != 0) {
+        /* Flip a bit in the input and verify that the signature is now
+         * detected as invalid. Flip a bit at the beginning, not at the end,
+         * because ECDSA may ignore the last few bits of the input. */
+        input_data->x[0] ^= 1;
+
+        /* Start verification. */
+        PSA_ASSERT(psa_verify_hash_start(&verify_operation, key, alg,
+                                         input_data->x, input_data->len,
+                                         signature, signature_length));
+
+        /* Continue performing the signature until complete. */
+        do {
+            status = psa_verify_hash_complete(&verify_operation);
+        } while (status == PSA_OPERATION_INCOMPLETE);
+
+        TEST_ASSERT(status ==  PSA_ERROR_INVALID_SIGNATURE);
+    }
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+exit:
+    /*
+     * Key attributes may have been returned by psa_get_key_attributes()
+     * thus reset them as required.
+     */
+    psa_reset_key_attributes(&attributes);
+
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void verify_hash(int key_type_arg, data_t *key_data,
+                 int alg_arg, data_t *hash_data,
+                 data_t *signature_data)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    TEST_LE_U(signature_data->len, PSA_SIGNATURE_MAX_SIZE);
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_VERIFY_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    PSA_ASSERT(psa_verify_hash(key, alg,
+                               hash_data->x, hash_data->len,
+                               signature_data->x, signature_data->len));
+
+exit:
+    psa_reset_key_attributes(&attributes);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:MBEDTLS_ECP_RESTARTABLE */
+/**
+ * verify_hash_interruptible() test intentions:
+ *
+ * Note: This test can currently only handle ECDSA.
+ *
+ * 1. Test interruptible verify hash with known outcomes (deterministic ECDSA
+ *    only). Given this test only does verification it can accept public keys as
+ *    well as private keys / keypairs.
+ *
+ * 2. Test the number of calls to psa_verify_hash_complete() required are as
+ *    expected for different max_ops values.
+ *
+ * 3. Test that the number of ops done prior to start and after abort is zero
+ *    and that each successful stage completes some ops (this is not mandated by
+ *    the PSA specification, but is currently the case).
+ *
+ * 4. Test that calling psa_sign_hash_get_num_ops() multiple times between
+ *    complete() calls does not alter the number of ops returned.
+ *
+ * 5. Test that after corrupting the hash, the verification detects an invalid
+ *    signature.
+ */
+void verify_hash_interruptible(int key_type_arg, data_t *key_data,
+                               int alg_arg, data_t *hash_data,
+                               data_t *signature_data, int max_ops_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_status_t status = PSA_OPERATION_INCOMPLETE;
+    uint32_t num_ops = 0;
+    uint32_t max_ops = max_ops_arg;
+    size_t num_ops_prior = 0;
+    size_t num_completes = 0;
+    size_t min_completes = 0;
+    size_t max_completes = 0;
+
+    psa_verify_hash_interruptible_operation_t operation =
+        psa_verify_hash_interruptible_operation_init();
+
+    TEST_LE_U(signature_data->len, PSA_SIGNATURE_MAX_SIZE);
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_VERIFY_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    psa_interruptible_set_max_ops(max_ops);
+
+    interruptible_signverify_get_minmax_completes(max_ops, PSA_SUCCESS,
+                                                  &min_completes, &max_completes);
+
+    num_ops_prior = psa_verify_hash_get_num_ops(&operation);
+
+    TEST_ASSERT(num_ops_prior == 0);
+
+    /* Start verification. */
+    PSA_ASSERT(psa_verify_hash_start(&operation, key, alg,
+                                     hash_data->x, hash_data->len,
+                                     signature_data->x, signature_data->len)
+               );
+
+    num_ops_prior = psa_verify_hash_get_num_ops(&operation);
+
+    TEST_ASSERT(num_ops_prior == 0);
+
+    /* Continue performing the signature until complete. */
+    do {
+        status = psa_verify_hash_complete(&operation);
+
+        num_completes++;
+
+        if (status == PSA_SUCCESS || status == PSA_OPERATION_INCOMPLETE) {
+            num_ops = psa_verify_hash_get_num_ops(&operation);
+            /* We are asserting here that every complete makes progress
+             * (completes some ops), which is true of the internal
+             * implementation and probably any implementation, however this is
+             * not mandated by the PSA specification. */
+            TEST_ASSERT(num_ops > num_ops_prior);
+
+            num_ops_prior = num_ops;
+
+            /* Ensure calling get_num_ops() twice still returns the same
+             * number of ops as previously reported. */
+            num_ops = psa_verify_hash_get_num_ops(&operation);
+
+            TEST_EQUAL(num_ops, num_ops_prior);
+        }
+    } while (status == PSA_OPERATION_INCOMPLETE);
+
+    TEST_ASSERT(status == PSA_SUCCESS);
+
+    TEST_LE_U(min_completes, num_completes);
+    TEST_LE_U(num_completes, max_completes);
+
+    PSA_ASSERT(psa_verify_hash_abort(&operation));
+
+    num_ops = psa_verify_hash_get_num_ops(&operation);
+    TEST_ASSERT(num_ops == 0);
+
+    if (hash_data->len != 0) {
+        /* Flip a bit in the hash and verify that the signature is now detected
+         * as invalid. Flip a bit at the beginning, not at the end, because
+         * ECDSA may ignore the last few bits of the input. */
+        hash_data->x[0] ^= 1;
+
+        /* Start verification. */
+        PSA_ASSERT(psa_verify_hash_start(&operation, key, alg,
+                                         hash_data->x, hash_data->len,
+                                         signature_data->x, signature_data->len));
+
+        /* Continue performing the signature until complete. */
+        do {
+            status = psa_verify_hash_complete(&operation);
+        } while (status == PSA_OPERATION_INCOMPLETE);
+
+        TEST_ASSERT(status ==  PSA_ERROR_INVALID_SIGNATURE);
+    }
+
+exit:
+    psa_reset_key_attributes(&attributes);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void verify_hash_fail(int key_type_arg, data_t *key_data,
+                      int alg_arg, data_t *hash_data,
+                      data_t *signature_data,
+                      int expected_status_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_status_t actual_status;
+    psa_status_t expected_status = expected_status_arg;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_VERIFY_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    actual_status = psa_verify_hash(key, alg,
+                                    hash_data->x, hash_data->len,
+                                    signature_data->x, signature_data->len);
+    TEST_EQUAL(actual_status, expected_status);
+
+exit:
+    psa_reset_key_attributes(&attributes);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:MBEDTLS_ECP_RESTARTABLE */
+/**
+ * verify_hash_fail_interruptible() test intentions:
+ *
+ * Note: This test can currently only handle ECDSA.
+ *
+ * 1. Test that various failure cases for interruptible verify hash fail with
+ *    the correct error codes, and at the correct point (at start or during
+ *    complete).
+ *
+ * 2. Test the number of calls to psa_verify_hash_complete() required are as
+ *    expected for different max_ops values.
+ *
+ * 3. Test that the number of ops done prior to start and after abort is zero
+ *    and that each successful stage completes some ops (this is not mandated by
+ *    the PSA specification, but is currently the case).
+ *
+ * 4. Check that calling complete() when start() fails and complete()
+ *    after completion results in a BAD_STATE error.
+ *
+ * 5. Check that calling start() again after start fails results in a BAD_STATE
+ *    error.
+ */
+void verify_hash_fail_interruptible(int key_type_arg, data_t *key_data,
+                                    int alg_arg, data_t *hash_data,
+                                    data_t *signature_data,
+                                    int expected_start_status_arg,
+                                    int expected_complete_status_arg,
+                                    int max_ops_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_status_t actual_status;
+    psa_status_t expected_start_status = expected_start_status_arg;
+    psa_status_t expected_complete_status = expected_complete_status_arg;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    uint32_t num_ops = 0;
+    uint32_t max_ops = max_ops_arg;
+    size_t num_ops_prior = 0;
+    size_t num_completes = 0;
+    size_t min_completes = 0;
+    size_t max_completes = 0;
+    psa_verify_hash_interruptible_operation_t operation =
+        psa_verify_hash_interruptible_operation_init();
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_VERIFY_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    psa_interruptible_set_max_ops(max_ops);
+
+    interruptible_signverify_get_minmax_completes(max_ops,
+                                                  expected_complete_status,
+                                                  &min_completes,
+                                                  &max_completes);
+
+    num_ops_prior = psa_verify_hash_get_num_ops(&operation);
+    TEST_ASSERT(num_ops_prior == 0);
+
+    /* Start verification. */
+    actual_status = psa_verify_hash_start(&operation, key, alg,
+                                          hash_data->x, hash_data->len,
+                                          signature_data->x,
+                                          signature_data->len);
+
+    TEST_EQUAL(actual_status, expected_start_status);
+
+    if (expected_start_status != PSA_SUCCESS) {
+        /* Emulate poor application code, and call complete anyway, even though
+         * start failed. */
+        actual_status = psa_verify_hash_complete(&operation);
+
+        TEST_EQUAL(actual_status, PSA_ERROR_BAD_STATE);
+
+        /* Test that calling start again after failure also causes BAD_STATE. */
+        actual_status = psa_verify_hash_start(&operation, key, alg,
+                                              hash_data->x, hash_data->len,
+                                              signature_data->x,
+                                              signature_data->len);
+
+        TEST_EQUAL(actual_status, PSA_ERROR_BAD_STATE);
+    }
+
+    num_ops_prior = psa_verify_hash_get_num_ops(&operation);
+    TEST_ASSERT(num_ops_prior == 0);
+
+    /* Continue performing the signature until complete. */
+    do {
+        actual_status = psa_verify_hash_complete(&operation);
+
+        num_completes++;
+
+        if (actual_status == PSA_SUCCESS ||
+            actual_status == PSA_OPERATION_INCOMPLETE) {
+            num_ops = psa_verify_hash_get_num_ops(&operation);
+            /* We are asserting here that every complete makes progress
+             * (completes some ops), which is true of the internal
+             * implementation and probably any implementation, however this is
+             * not mandated by the PSA specification. */
+            TEST_ASSERT(num_ops > num_ops_prior);
+
+            num_ops_prior = num_ops;
+        }
+    } while (actual_status == PSA_OPERATION_INCOMPLETE);
+
+    TEST_EQUAL(actual_status, expected_complete_status);
+
+    /* Check that another complete returns BAD_STATE. */
+    actual_status = psa_verify_hash_complete(&operation);
+    TEST_EQUAL(actual_status, PSA_ERROR_BAD_STATE);
+
+    TEST_LE_U(min_completes, num_completes);
+    TEST_LE_U(num_completes, max_completes);
+
+    PSA_ASSERT(psa_verify_hash_abort(&operation));
+
+    num_ops = psa_verify_hash_get_num_ops(&operation);
+    TEST_ASSERT(num_ops == 0);
+
+exit:
+    psa_reset_key_attributes(&attributes);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:MBEDTLS_ECP_RESTARTABLE */
+/**
+ * interruptible_signverify_hash_state_test() test intentions:
+ *
+ * Note: This test can currently only handle ECDSA.
+ *
+ * 1. Test that calling the various interruptible sign and verify hash functions
+ *    in incorrect orders returns BAD_STATE errors.
+ */
+void interruptible_signverify_hash_state_test(int key_type_arg,
+                                              data_t *key_data, int alg_arg, data_t *input_data)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t key_bits;
+    unsigned char *signature = NULL;
+    size_t signature_size;
+    size_t signature_length = 0xdeadbeef;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_sign_hash_interruptible_operation_t sign_operation =
+        psa_sign_hash_interruptible_operation_init();
+    psa_verify_hash_interruptible_operation_t verify_operation =
+        psa_verify_hash_interruptible_operation_init();
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH |
+                            PSA_KEY_USAGE_VERIFY_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+    PSA_ASSERT(psa_get_key_attributes(key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    /* Allocate a buffer which has the size advertised by the
+     * library. */
+    signature_size = PSA_SIGN_OUTPUT_SIZE(key_type,
+                                          key_bits, alg);
+    TEST_ASSERT(signature_size != 0);
+    TEST_LE_U(signature_size, PSA_SIGNATURE_MAX_SIZE);
+    TEST_CALLOC(signature, signature_size);
+
+    psa_interruptible_set_max_ops(PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED);
+
+    /* --- Attempt completes prior to starts --- */
+    TEST_EQUAL(psa_sign_hash_complete(&sign_operation, signature,
+                                      signature_size,
+                                      &signature_length),
+               PSA_ERROR_BAD_STATE);
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    TEST_EQUAL(psa_verify_hash_complete(&verify_operation),
+               PSA_ERROR_BAD_STATE);
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+    /* --- Aborts in all other places. --- */
+    psa_sign_hash_abort(&sign_operation);
+
+    PSA_ASSERT(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_data->x, input_data->len));
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    psa_interruptible_set_max_ops(1);
+
+    PSA_ASSERT(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_data->x, input_data->len));
+
+    TEST_EQUAL(psa_sign_hash_complete(&sign_operation, signature,
+                                      signature_size,
+                                      &signature_length),
+               PSA_OPERATION_INCOMPLETE);
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    psa_interruptible_set_max_ops(PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED);
+
+    PSA_ASSERT(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_data->x, input_data->len));
+
+    PSA_ASSERT(psa_sign_hash_complete(&sign_operation, signature,
+                                      signature_size,
+                                      &signature_length));
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+    PSA_ASSERT(psa_verify_hash_start(&verify_operation, key, alg,
+                                     input_data->x, input_data->len,
+                                     signature, signature_length));
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+    psa_interruptible_set_max_ops(1);
+
+    PSA_ASSERT(psa_verify_hash_start(&verify_operation, key, alg,
+                                     input_data->x, input_data->len,
+                                     signature, signature_length));
+
+    TEST_EQUAL(psa_verify_hash_complete(&verify_operation),
+               PSA_OPERATION_INCOMPLETE);
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+    psa_interruptible_set_max_ops(PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED);
+
+    PSA_ASSERT(psa_verify_hash_start(&verify_operation, key, alg,
+                                     input_data->x, input_data->len,
+                                     signature, signature_length));
+
+    PSA_ASSERT(psa_verify_hash_complete(&verify_operation));
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+    /* --- Attempt double starts. --- */
+
+    PSA_ASSERT(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_data->x, input_data->len));
+
+    TEST_EQUAL(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_data->x, input_data->len),
+               PSA_ERROR_BAD_STATE);
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    PSA_ASSERT(psa_verify_hash_start(&verify_operation, key, alg,
+                                     input_data->x, input_data->len,
+                                     signature, signature_length));
+
+    TEST_EQUAL(psa_verify_hash_start(&verify_operation, key, alg,
+                                     input_data->x, input_data->len,
+                                     signature, signature_length),
+               PSA_ERROR_BAD_STATE);
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+exit:
+    /*
+     * Key attributes may have been returned by psa_get_key_attributes()
+     * thus reset them as required.
+     */
+    psa_reset_key_attributes(&attributes);
+
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:MBEDTLS_ECP_RESTARTABLE */
+/**
+ * interruptible_signverify_hash_edgecase_tests() test intentions:
+ *
+ * Note: This test can currently only handle ECDSA.
+ *
+ * 1. Test various edge cases in the interruptible sign and verify hash
+ *    interfaces.
+ */
+void interruptible_signverify_hash_edgecase_tests(int key_type_arg,
+                                                  data_t *key_data, int alg_arg, data_t *input_data)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t key_bits;
+    unsigned char *signature = NULL;
+    size_t signature_size;
+    size_t signature_length = 0xdeadbeef;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    uint8_t *input_buffer = NULL;
+    psa_sign_hash_interruptible_operation_t sign_operation =
+        psa_sign_hash_interruptible_operation_init();
+    psa_verify_hash_interruptible_operation_t verify_operation =
+        psa_verify_hash_interruptible_operation_init();
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH |
+                            PSA_KEY_USAGE_VERIFY_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+    PSA_ASSERT(psa_get_key_attributes(key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    /* Allocate a buffer which has the size advertised by the
+     * library. */
+    signature_size = PSA_SIGN_OUTPUT_SIZE(key_type,
+                                          key_bits, alg);
+    TEST_ASSERT(signature_size != 0);
+    TEST_LE_U(signature_size, PSA_SIGNATURE_MAX_SIZE);
+    TEST_CALLOC(signature, signature_size);
+
+    /* --- Change function inputs mid run, to cause an error (sign only,
+     *     verify passes all inputs to start. --- */
+
+    psa_interruptible_set_max_ops(1);
+
+    PSA_ASSERT(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_data->x, input_data->len));
+
+    TEST_EQUAL(psa_sign_hash_complete(&sign_operation, signature,
+                                      signature_size,
+                                      &signature_length),
+               PSA_OPERATION_INCOMPLETE);
+
+    TEST_EQUAL(psa_sign_hash_complete(&sign_operation, signature,
+                                      0,
+                                      &signature_length),
+               PSA_ERROR_BUFFER_TOO_SMALL);
+
+    /* And test that this invalidates the operation. */
+    TEST_EQUAL(psa_sign_hash_complete(&sign_operation, signature,
+                                      0,
+                                      &signature_length),
+               PSA_ERROR_BAD_STATE);
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    /* Trash the hash buffer in between start and complete, to ensure
+     * no reliance on external buffers. */
+    psa_interruptible_set_max_ops(PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED);
+
+    input_buffer = mbedtls_calloc(1, input_data->len);
+    TEST_ASSERT(input_buffer != NULL);
+
+    memcpy(input_buffer, input_data->x, input_data->len);
+
+    PSA_ASSERT(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_buffer, input_data->len));
+
+    memset(input_buffer, '!', input_data->len);
+    mbedtls_free(input_buffer);
+    input_buffer = NULL;
+
+    PSA_ASSERT(psa_sign_hash_complete(&sign_operation, signature,
+                                      signature_size,
+                                      &signature_length));
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    input_buffer = mbedtls_calloc(1, input_data->len);
+    TEST_ASSERT(input_buffer != NULL);
+
+    memcpy(input_buffer, input_data->x, input_data->len);
+
+    PSA_ASSERT(psa_verify_hash_start(&verify_operation, key, alg,
+                                     input_buffer, input_data->len,
+                                     signature, signature_length));
+
+    memset(input_buffer, '!', input_data->len);
+    mbedtls_free(input_buffer);
+    input_buffer = NULL;
+
+    PSA_ASSERT(psa_verify_hash_complete(&verify_operation));
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+exit:
+    /*
+     * Key attributes may have been returned by psa_get_key_attributes()
+     * thus reset them as required.
+     */
+    psa_reset_key_attributes(&attributes);
+
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:MBEDTLS_ECP_RESTARTABLE */
+/**
+ * interruptible_signverify_hash_ops_tests() test intentions:
+ *
+ * Note: This test can currently only handle ECDSA.
+ *
+ * 1. Test that setting max ops is reflected in both interruptible sign and
+ *    verify hash
+ * 2. Test that changing the value of max_ops to unlimited during an operation
+ *    causes that operation to complete in the next call.
+ *
+ * 3. Test that calling get_num_ops() between complete calls gives the same
+ *    result as calling get_num_ops() once at the end of the operation.
+ */
+void interruptible_signverify_hash_ops_tests(int key_type_arg,
+                                             data_t *key_data, int alg_arg,
+                                             data_t *input_data)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    size_t key_bits;
+    unsigned char *signature = NULL;
+    size_t signature_size;
+    size_t signature_length = 0xdeadbeef;
+    uint32_t num_ops = 0;
+    psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
+
+    psa_sign_hash_interruptible_operation_t sign_operation =
+        psa_sign_hash_interruptible_operation_init();
+    psa_verify_hash_interruptible_operation_t verify_operation =
+        psa_verify_hash_interruptible_operation_init();
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH |
+                            PSA_KEY_USAGE_VERIFY_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len, &key));
+    PSA_ASSERT(psa_get_key_attributes(key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    /* Allocate a buffer which has the size advertised by the
+     * library. */
+    signature_size = PSA_SIGN_OUTPUT_SIZE(key_type, key_bits, alg);
+
+    TEST_ASSERT(signature_size != 0);
+    TEST_LE_U(signature_size, PSA_SIGNATURE_MAX_SIZE);
+    TEST_CALLOC(signature, signature_size);
+
+    /* Check that default max ops gets set if we don't set it. */
+    PSA_ASSERT(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_data->x, input_data->len));
+
+    TEST_EQUAL(psa_interruptible_get_max_ops(),
+               PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED);
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    PSA_ASSERT(psa_verify_hash_start(&verify_operation, key, alg,
+                                     input_data->x, input_data->len,
+                                     signature, signature_size));
+
+    TEST_EQUAL(psa_interruptible_get_max_ops(),
+               PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED);
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+    /* Check that max ops gets set properly. */
+
+    psa_interruptible_set_max_ops(0xbeef);
+
+    TEST_EQUAL(psa_interruptible_get_max_ops(), 0xbeef);
+
+    /* --- Ensure changing the max ops mid operation works (operation should
+     *     complete successfully after setting max ops to unlimited --- */
+    psa_interruptible_set_max_ops(1);
+
+    PSA_ASSERT(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_data->x, input_data->len));
+
+    TEST_EQUAL(psa_sign_hash_complete(&sign_operation, signature,
+                                      signature_size,
+                                      &signature_length),
+               PSA_OPERATION_INCOMPLETE);
+
+    psa_interruptible_set_max_ops(PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED);
+
+    PSA_ASSERT(psa_sign_hash_complete(&sign_operation, signature,
+                                      signature_size,
+                                      &signature_length));
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    psa_interruptible_set_max_ops(1);
+
+    PSA_ASSERT(psa_verify_hash_start(&verify_operation, key, alg,
+                                     input_data->x, input_data->len,
+                                     signature, signature_length));
+
+    TEST_EQUAL(psa_verify_hash_complete(&verify_operation),
+               PSA_OPERATION_INCOMPLETE);
+
+    psa_interruptible_set_max_ops(PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED);
+
+    PSA_ASSERT(psa_verify_hash_complete(&verify_operation));
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+    /* --- Test that not calling get_num_ops inbetween complete calls does not
+     *     result in lost ops. ---*/
+
+    psa_interruptible_set_max_ops(1);
+
+    PSA_ASSERT(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_data->x, input_data->len));
+
+    /* Continue performing the signature until complete. */
+    do {
+        status = psa_sign_hash_complete(&sign_operation, signature,
+                                        signature_size,
+                                        &signature_length);
+
+        num_ops = psa_sign_hash_get_num_ops(&sign_operation);
+
+    } while (status == PSA_OPERATION_INCOMPLETE);
+
+    PSA_ASSERT(status);
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    PSA_ASSERT(psa_sign_hash_start(&sign_operation, key, alg,
+                                   input_data->x, input_data->len));
+
+    /* Continue performing the signature until complete. */
+    do {
+        status = psa_sign_hash_complete(&sign_operation, signature,
+                                        signature_size,
+                                        &signature_length);
+    } while (status == PSA_OPERATION_INCOMPLETE);
+
+    PSA_ASSERT(status);
+
+    TEST_EQUAL(num_ops, psa_sign_hash_get_num_ops(&sign_operation));
+
+    PSA_ASSERT(psa_sign_hash_abort(&sign_operation));
+
+    PSA_ASSERT(psa_verify_hash_start(&verify_operation, key, alg,
+                                     input_data->x, input_data->len,
+                                     signature, signature_length));
+
+    /* Continue performing the verification until complete. */
+    do {
+        status = psa_verify_hash_complete(&verify_operation);
+
+        num_ops = psa_verify_hash_get_num_ops(&verify_operation);
+
+    } while (status == PSA_OPERATION_INCOMPLETE);
+
+    PSA_ASSERT(status);
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+    PSA_ASSERT(psa_verify_hash_start(&verify_operation, key, alg,
+                                     input_data->x, input_data->len,
+                                     signature, signature_length));
+
+    /* Continue performing the verification until complete. */
+    do {
+        status = psa_verify_hash_complete(&verify_operation);
+
+    } while (status == PSA_OPERATION_INCOMPLETE);
+
+    PSA_ASSERT(status);
+
+    TEST_EQUAL(num_ops, psa_verify_hash_get_num_ops(&verify_operation));
+
+    PSA_ASSERT(psa_verify_hash_abort(&verify_operation));
+
+exit:
+    /*
+     * Key attributes may have been returned by psa_get_key_attributes()
+     * thus reset them as required.
+     */
+    psa_reset_key_attributes(&attributes);
+
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void sign_message_deterministic(int key_type_arg,
+                                data_t *key_data,
+                                int alg_arg,
+                                data_t *input_data,
+                                data_t *output_data)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t key_bits;
+    unsigned char *signature = NULL;
+    size_t signature_size;
+    size_t signature_length = 0xdeadbeef;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+    PSA_ASSERT(psa_get_key_attributes(key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    signature_size = PSA_SIGN_OUTPUT_SIZE(key_type, key_bits, alg);
+    TEST_ASSERT(signature_size != 0);
+    TEST_LE_U(signature_size, PSA_SIGNATURE_MAX_SIZE);
+    TEST_CALLOC(signature, signature_size);
+
+    PSA_ASSERT(psa_sign_message(key, alg,
+                                input_data->x, input_data->len,
+                                signature, signature_size,
+                                &signature_length));
+
+    TEST_MEMORY_COMPARE(output_data->x, output_data->len,
+                        signature, signature_length);
+
+exit:
+    psa_reset_key_attributes(&attributes);
+
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void sign_message_fail(int key_type_arg,
+                       data_t *key_data,
+                       int alg_arg,
+                       data_t *input_data,
+                       int signature_size_arg,
+                       int expected_status_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t signature_size = signature_size_arg;
+    psa_status_t actual_status;
+    psa_status_t expected_status = expected_status_arg;
+    unsigned char *signature = NULL;
+    size_t signature_length = 0xdeadbeef;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    TEST_CALLOC(signature, signature_size);
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    actual_status = psa_sign_message(key, alg,
+                                     input_data->x, input_data->len,
+                                     signature, signature_size,
+                                     &signature_length);
+    TEST_EQUAL(actual_status, expected_status);
+    /* The value of *signature_length is unspecified on error, but
+     * whatever it is, it should be less than signature_size, so that
+     * if the caller tries to read *signature_length bytes without
+     * checking the error code then they don't overflow a buffer. */
+    TEST_LE_U(signature_length, signature_size);
+
+exit:
+    psa_reset_key_attributes(&attributes);
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void sign_verify_message(int key_type_arg,
+                         data_t *key_data,
+                         int alg_arg,
+                         data_t *input_data)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t key_bits;
+    unsigned char *signature = NULL;
+    size_t signature_size;
+    size_t signature_length = 0xdeadbeef;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE |
+                            PSA_KEY_USAGE_VERIFY_MESSAGE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+    PSA_ASSERT(psa_get_key_attributes(key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    signature_size = PSA_SIGN_OUTPUT_SIZE(key_type, key_bits, alg);
+    TEST_ASSERT(signature_size != 0);
+    TEST_LE_U(signature_size, PSA_SIGNATURE_MAX_SIZE);
+    TEST_CALLOC(signature, signature_size);
+
+    PSA_ASSERT(psa_sign_message(key, alg,
+                                input_data->x, input_data->len,
+                                signature, signature_size,
+                                &signature_length));
+    TEST_LE_U(signature_length, signature_size);
+    TEST_ASSERT(signature_length > 0);
+
+    PSA_ASSERT(psa_verify_message(key, alg,
+                                  input_data->x, input_data->len,
+                                  signature, signature_length));
+
+    if (input_data->len != 0) {
+        /* Flip a bit in the input and verify that the signature is now
+         * detected as invalid. Flip a bit at the beginning, not at the end,
+         * because ECDSA may ignore the last few bits of the input. */
+        input_data->x[0] ^= 1;
+        TEST_EQUAL(psa_verify_message(key, alg,
+                                      input_data->x, input_data->len,
+                                      signature, signature_length),
+                   PSA_ERROR_INVALID_SIGNATURE);
+    }
+
+exit:
+    psa_reset_key_attributes(&attributes);
+
+    psa_destroy_key(key);
+    mbedtls_free(signature);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void verify_message(int key_type_arg,
+                    data_t *key_data,
+                    int alg_arg,
+                    data_t *input_data,
+                    data_t *signature_data)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    TEST_LE_U(signature_data->len, PSA_SIGNATURE_MAX_SIZE);
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_VERIFY_MESSAGE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    PSA_ASSERT(psa_verify_message(key, alg,
+                                  input_data->x, input_data->len,
+                                  signature_data->x, signature_data->len));
+
+exit:
+    psa_reset_key_attributes(&attributes);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void verify_message_fail(int key_type_arg,
+                         data_t *key_data,
+                         int alg_arg,
+                         data_t *hash_data,
+                         data_t *signature_data,
+                         int expected_status_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    psa_status_t actual_status;
+    psa_status_t expected_status = expected_status_arg;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_VERIFY_MESSAGE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    actual_status = psa_verify_message(key, alg,
+                                       hash_data->x, hash_data->len,
+                                       signature_data->x,
+                                       signature_data->len);
+    TEST_EQUAL(actual_status, expected_status);
+
+exit:
+    psa_reset_key_attributes(&attributes);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void asymmetric_encrypt(int key_type_arg,
+                        data_t *key_data,
+                        int alg_arg,
+                        data_t *input_data,
+                        data_t *label,
+                        int expected_output_length_arg,
+                        int expected_status_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_type_t key_type = key_type_arg;
+    psa_algorithm_t alg = alg_arg;
+    size_t expected_output_length = expected_output_length_arg;
+    size_t key_bits;
+    unsigned char *output = NULL;
+    size_t output_size;
+    size_t output_length = ~0;
+    psa_status_t actual_status;
+    psa_status_t expected_status = expected_status_arg;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    /* Import the key */
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    /* Determine the maximum output length */
+    PSA_ASSERT(psa_get_key_attributes(key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    output_size = PSA_ASYMMETRIC_ENCRYPT_OUTPUT_SIZE(key_type, key_bits, alg);
+    TEST_LE_U(output_size, PSA_ASYMMETRIC_ENCRYPT_OUTPUT_MAX_SIZE);
+    TEST_CALLOC(output, output_size);
+
+    /* Encrypt the input */
+    actual_status = psa_asymmetric_encrypt(key, alg,
+                                           input_data->x, input_data->len,
+                                           label->x, label->len,
+                                           output, output_size,
+                                           &output_length);
+    TEST_EQUAL(actual_status, expected_status);
+    if (actual_status == PSA_SUCCESS) {
+        TEST_EQUAL(output_length, expected_output_length);
+    } else {
+        TEST_LE_U(output_length, output_size);
+    }
+
+    /* If the label is empty, the test framework puts a non-null pointer
+     * in label->x. Test that a null pointer works as well. */
+    if (label->len == 0) {
+        output_length = ~0;
+        if (output_size != 0) {
+            memset(output, 0, output_size);
+        }
+        actual_status = psa_asymmetric_encrypt(key, alg,
+                                               input_data->x, input_data->len,
+                                               NULL, label->len,
+                                               output, output_size,
+                                               &output_length);
+        TEST_EQUAL(actual_status, expected_status);
+        if (actual_status == PSA_SUCCESS) {
+            TEST_EQUAL(output_length, expected_output_length);
+        } else {
+            TEST_LE_U(output_length, output_size);
+        }
+    }
+
+exit:
+    /*
+     * Key attributes may have been returned by psa_get_key_attributes()
+     * thus reset them as required.
+     */
+    psa_reset_key_attributes(&attributes);
+
+    psa_destroy_key(key);
+    mbedtls_free(output);
+    PSA_DONE();
+}
+/* END_CASE */

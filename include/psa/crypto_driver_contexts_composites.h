@@ -133,9 +133,9 @@ typedef union {
 #if defined(IFX_PSA_SE_DPA_PRESENT)
     ifx_se_mac_operation_t ifx_se_dpa_ctx;
 #endif /* IFX_PSA_SE_DPA_PRESENT */
-#if defined(IFX_PSA_MXCRYPTO_PRESENT)
+#if defined(IFX_PSA_MXCRYPTO_PRESENT) && defined(IFX_PSA_MXCRYPTO_MAC)
     ifx_mxcrypto_transparent_mac_operation_t ifx_mxcrypto_ctx;
-#endif /* IFX_PSA_CRYPTOLITE_PRESENT */
+#endif /* IFX_PSA_CRYPTOLITE_PRESENT && IFX_PSA_MXCRYPTO_MAC */
 #if defined(IFX_PSA_CRYPTOLITE_PRESENT) && defined(IFX_PSA_CRYPTOLITE_HMAC)
     ifx_cryptolite_transparent_mac_operation_t ifx_cryptolite_ctx;
 #endif /* IFX_PSA_CRYPTOLITE_PRESENT && IFX_PSA_CRYPTOLITE_HMAC */

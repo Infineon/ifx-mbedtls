@@ -27,7 +27,7 @@
 #define IFX_PSA_MXCRYPTO_PRESENT
 
 /* Enable CRYPTOLITE transparent driver */
-/* #define IFX_PSA_CRYPTOLITE_PRESENT */
+// #define IFX_PSA_CRYPTOLITE_PRESENT
 
 /* Use SE RT Services to calculate SHA256 digest */
 #define IFX_PSA_SHA256_BY_SE_DPA

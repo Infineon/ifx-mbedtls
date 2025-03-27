@@ -1,0 +1,2377 @@
+/* BEGIN_HEADER */
+#include <stdint.h>
+
+#include "mbedtls/asn1.h"
+#include "mbedtls/asn1write.h"
+#include "mbedtls/oid.h"
+#include "common.h"
+
+/* For MBEDTLS_CTR_DRBG_MAX_REQUEST, knowing that psa_generate_random()
+ * uses mbedtls_ctr_drbg internally. */
+#include "mbedtls/ctr_drbg.h"
+
+#include "psa/crypto.h"
+#include "psa_crypto_slot_management.h"
+
+/* For psa_can_do_hash() */
+#include "psa_crypto_core.h"
+
+#include "test/asn1_helpers.h"
+#include "test/psa_crypto_helpers.h"
+#include "test/psa_exercise_key.h"
+#if defined(PSA_CRYPTO_DRIVER_TEST)
+#include "test/drivers/test_driver.h"
+#define TEST_DRIVER_LOCATION PSA_CRYPTO_TEST_DRIVER_LOCATION
+#else
+#define TEST_DRIVER_LOCATION 0x7fffff
+#endif
+
+/* If this comes up, it's a bug in the test code or in the test data. */
+#define UNUSED 0xdeadbeef
+
+/* Assert that an operation is (not) active.
+ * This serves as a proxy for checking if the operation is aborted. */
+#define ASSERT_OPERATION_IS_ACTIVE(operation) TEST_ASSERT(operation.id != 0)
+#define ASSERT_OPERATION_IS_INACTIVE(operation) TEST_ASSERT(operation.id == 0)
+
+#if defined(PSA_WANT_ALG_JPAKE)
+int ecjpake_operation_setup(psa_pake_operation_t *operation,
+                            psa_pake_cipher_suite_t *cipher_suite,
+                            psa_pake_role_t role,
+                            mbedtls_svc_key_id_t key,
+                            size_t key_available)
+{
+    PSA_ASSERT(psa_pake_abort(operation));
+
+    PSA_ASSERT(psa_pake_setup(operation, cipher_suite));
+
+    PSA_ASSERT(psa_pake_set_role(operation, role));
+
+    if (key_available) {
+        PSA_ASSERT(psa_pake_set_password_key(operation, key));
+    }
+    return 0;
+exit:
+    return 1;
+}
+#endif
+
+/** An invalid export length that will never be set by psa_export_key(). */
+static const size_t INVALID_EXPORT_LENGTH = ~0U;
+
+int exercise_mac_setup(psa_key_type_t key_type,
+                       const unsigned char *key_bytes,
+                       size_t key_length,
+                       psa_algorithm_t alg,
+                       psa_mac_operation_t *operation,
+                       psa_status_t *status)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+    PSA_ASSERT(psa_import_key(&attributes, key_bytes, key_length, &key));
+
+    *status = psa_mac_sign_setup(operation, key, alg);
+    /* Whether setup succeeded or failed, abort must succeed. */
+    PSA_ASSERT(psa_mac_abort(operation));
+    /* If setup failed, reproduce the failure, so that the caller can
+     * test the resulting state of the operation object. */
+    if (*status != PSA_SUCCESS) {
+        TEST_EQUAL(psa_mac_sign_setup(operation, key, alg), *status);
+    }
+
+    psa_destroy_key(key);
+    return 1;
+
+exit:
+    psa_destroy_key(key);
+    return 0;
+}
+
+int exercise_cipher_setup(psa_key_type_t key_type,
+                          const unsigned char *key_bytes,
+                          size_t key_length,
+                          psa_algorithm_t alg,
+                          psa_cipher_operation_t *operation,
+                          psa_status_t *status)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+    PSA_ASSERT(psa_import_key(&attributes, key_bytes, key_length, &key));
+
+    *status = psa_cipher_encrypt_setup(operation, key, alg);
+    /* Whether setup succeeded or failed, abort must succeed. */
+    PSA_ASSERT(psa_cipher_abort(operation));
+    /* If setup failed, reproduce the failure, so that the caller can
+     * test the resulting state of the operation object. */
+    if (*status != PSA_SUCCESS) {
+        TEST_EQUAL(psa_cipher_encrypt_setup(operation, key, alg),
+                   *status);
+    }
+
+    psa_destroy_key(key);
+    return 1;
+
+exit:
+    psa_destroy_key(key);
+    return 0;
+}
+
+/* Assert that a key isn't reported as having a slot number. */
+#if defined(MBEDTLS_PSA_CRYPTO_SE_C)
+#define ASSERT_NO_SLOT_NUMBER(attributes)                             \
+    do                                                                  \
+    {                                                                   \
+        psa_key_slot_number_t ASSERT_NO_SLOT_NUMBER_slot_number;        \
+        TEST_EQUAL(psa_get_key_slot_number(                            \
+                       attributes,                                     \
+                       &ASSERT_NO_SLOT_NUMBER_slot_number),           \
+                   PSA_ERROR_INVALID_ARGUMENT);                       \
+    }                                                                   \
+    while (0)
+#else /* MBEDTLS_PSA_CRYPTO_SE_C */
+#define ASSERT_NO_SLOT_NUMBER(attributes)     \
+    ((void) 0)
+#endif /* MBEDTLS_PSA_CRYPTO_SE_C */
+
+#define INPUT_INTEGER 0x10000   /* Out of range of psa_key_type_t */
+
+/* An overapproximation of the amount of storage needed for a key of the
+ * given type and with the given content. The API doesn't make it easy
+ * to find a good value for the size. The current implementation doesn't
+ * care about the value anyway. */
+#define KEY_BITS_FROM_DATA(type, data)        \
+    (data)->len
+
+typedef enum {
+    IMPORT_KEY = 0,
+    GENERATE_KEY = 1,
+    DERIVE_KEY = 2
+} generate_method;
+
+typedef enum {
+    DO_NOT_SET_LENGTHS = 0,
+    SET_LENGTHS_BEFORE_NONCE = 1,
+    SET_LENGTHS_AFTER_NONCE = 2
+} set_lengths_method_t;
+
+typedef enum {
+    USE_NULL_TAG = 0,
+    USE_GIVEN_TAG = 1,
+} tag_usage_method_t;
+
+typedef enum {
+    INJECT_ERR_NONE = 0,
+    INJECT_ERR_UNINITIALIZED_ACCESS,
+    INJECT_ERR_DUPLICATE_SETUP,
+    INJECT_ERR_INVALID_USER,
+    INJECT_ERR_INVALID_PEER,
+    INJECT_ERR_SET_USER,
+    INJECT_ERR_SET_PEER,
+    INJECT_EMPTY_IO_BUFFER,
+    INJECT_UNKNOWN_STEP,
+    INJECT_INVALID_FIRST_STEP,
+    INJECT_WRONG_BUFFER_SIZE,
+    INJECT_VALID_OPERATION_AFTER_FAILURE,
+    INJECT_ANTICIPATE_KEY_DERIVATION_1,
+    INJECT_ANTICIPATE_KEY_DERIVATION_2,
+} ecjpake_injected_failure_t;
+
+#if defined(MBEDTLS_ECP_RESTARTABLE)
+
+static void interruptible_signverify_get_minmax_completes(uint32_t max_ops,
+                                                          psa_status_t expected_status,
+                                                          size_t *min_completes,
+                                                          size_t *max_completes)
+{
+
+    /* This is slightly contrived, but we only really know that with a minimum
+       value of max_ops that a successful operation should take more than one op
+       to complete, and likewise that with a max_ops of
+       PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED, it should complete in one go. */
+    if (max_ops == 0 || max_ops == 1) {
+
+        if (expected_status == PSA_SUCCESS) {
+            *min_completes = 2;
+        } else {
+            *min_completes = 1;
+        }
+
+        *max_completes = PSA_INTERRUPTIBLE_MAX_OPS_UNLIMITED;
+    } else {
+        *min_completes = 1;
+        *max_completes = 1;
+    }
+}
+#endif /* MBEDTLS_ECP_RESTARTABLE */
+
+#if defined(PSA_WANT_ALG_JPAKE)
+static void ecjpake_do_round(psa_algorithm_t alg, unsigned int primitive,
+                             psa_pake_operation_t *server,
+                             psa_pake_operation_t *client,
+                             int client_input_first,
+                             int round, int inject_error)
+{
+    unsigned char *buffer0 = NULL, *buffer1 = NULL;
+    size_t buffer_length = (
+        PSA_PAKE_OUTPUT_SIZE(alg, primitive, PSA_PAKE_STEP_KEY_SHARE) +
+        PSA_PAKE_OUTPUT_SIZE(alg, primitive, PSA_PAKE_STEP_ZK_PUBLIC) +
+        PSA_PAKE_OUTPUT_SIZE(alg, primitive, PSA_PAKE_STEP_ZK_PROOF)) * 2;
+    /* The output should be exactly this size according to the spec */
+    const size_t expected_size_key_share =
+        PSA_PAKE_OUTPUT_SIZE(alg, primitive, PSA_PAKE_STEP_KEY_SHARE);
+    /* The output should be exactly this size according to the spec */
+    const size_t expected_size_zk_public =
+        PSA_PAKE_OUTPUT_SIZE(alg, primitive, PSA_PAKE_STEP_ZK_PUBLIC);
+    /* The output can be smaller: the spec allows stripping leading zeroes */
+    const size_t max_expected_size_zk_proof =
+        PSA_PAKE_OUTPUT_SIZE(alg, primitive, PSA_PAKE_STEP_ZK_PROOF);
+    size_t buffer0_off = 0;
+    size_t buffer1_off = 0;
+    size_t s_g1_len, s_g2_len, s_a_len;
+    size_t s_g1_off, s_g2_off, s_a_off;
+    size_t s_x1_pk_len, s_x2_pk_len, s_x2s_pk_len;
+    size_t s_x1_pk_off, s_x2_pk_off, s_x2s_pk_off;
+    size_t s_x1_pr_len, s_x2_pr_len, s_x2s_pr_len;
+    size_t s_x1_pr_off, s_x2_pr_off, s_x2s_pr_off;
+    size_t c_g1_len, c_g2_len, c_a_len;
+    size_t c_g1_off, c_g2_off, c_a_off;
+    size_t c_x1_pk_len, c_x2_pk_len, c_x2s_pk_len;
+    size_t c_x1_pk_off, c_x2_pk_off, c_x2s_pk_off;
+    size_t c_x1_pr_len, c_x2_pr_len, c_x2s_pr_len;
+    size_t c_x1_pr_off, c_x2_pr_off, c_x2s_pr_off;
+    psa_status_t expected_status = PSA_SUCCESS;
+    psa_status_t status;
+
+    TEST_CALLOC(buffer0, buffer_length);
+    TEST_CALLOC(buffer1, buffer_length);
+
+    switch (round) {
+        case 1:
+            /* Server first round Output */
+            PSA_ASSERT(psa_pake_output(server, PSA_PAKE_STEP_KEY_SHARE,
+                                       buffer0 + buffer0_off,
+                                       512 - buffer0_off, &s_g1_len));
+            TEST_EQUAL(s_g1_len, expected_size_key_share);
+            s_g1_off = buffer0_off;
+            buffer0_off += s_g1_len;
+            PSA_ASSERT(psa_pake_output(server, PSA_PAKE_STEP_ZK_PUBLIC,
+                                       buffer0 + buffer0_off,
+                                       512 - buffer0_off, &s_x1_pk_len));
+            TEST_EQUAL(s_x1_pk_len, expected_size_zk_public);
+            s_x1_pk_off = buffer0_off;
+            buffer0_off += s_x1_pk_len;
+            PSA_ASSERT(psa_pake_output(server, PSA_PAKE_STEP_ZK_PROOF,
+                                       buffer0 + buffer0_off,
+                                       512 - buffer0_off, &s_x1_pr_len));
+            TEST_LE_U(s_x1_pr_len, max_expected_size_zk_proof);
+            s_x1_pr_off = buffer0_off;
+            buffer0_off += s_x1_pr_len;
+            PSA_ASSERT(psa_pake_output(server, PSA_PAKE_STEP_KEY_SHARE,
+                                       buffer0 + buffer0_off,
+                                       512 - buffer0_off, &s_g2_len));
+            TEST_EQUAL(s_g2_len, expected_size_key_share);
+            s_g2_off = buffer0_off;
+            buffer0_off += s_g2_len;
+            PSA_ASSERT(psa_pake_output(server, PSA_PAKE_STEP_ZK_PUBLIC,
+                                       buffer0 + buffer0_off,
+                                       512 - buffer0_off, &s_x2_pk_len));
+            TEST_EQUAL(s_x2_pk_len, expected_size_zk_public);
+            s_x2_pk_off = buffer0_off;
+            buffer0_off += s_x2_pk_len;
+            PSA_ASSERT(psa_pake_output(server, PSA_PAKE_STEP_ZK_PROOF,
+                                       buffer0 + buffer0_off,
+                                       512 - buffer0_off, &s_x2_pr_len));
+            TEST_LE_U(s_x2_pr_len, max_expected_size_zk_proof);
+            s_x2_pr_off = buffer0_off;
+            buffer0_off += s_x2_pr_len;
+
+            if (inject_error == 1) {
+                buffer0[s_x1_pr_off + 8] ^= 1;
+                buffer0[s_x2_pr_off + 7] ^= 1;
+                expected_status = PSA_ERROR_DATA_INVALID;
+            }
+
+            /*
+             * When injecting errors in inputs, the implementation is
+             * free to detect it right away of with a delay.
+             * This permits delaying the error until the end of the input
+             * sequence, if no error appears then, this will be treated
+             * as an error.
+             */
+
+            if (client_input_first == 1) {
+                /* Client first round Input */
+                status = psa_pake_input(client, PSA_PAKE_STEP_KEY_SHARE,
+                                        buffer0 + s_g1_off, s_g1_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PUBLIC,
+                                        buffer0 + s_x1_pk_off,
+                                        s_x1_pk_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PROOF,
+                                        buffer0 + s_x1_pr_off,
+                                        s_x1_pr_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_KEY_SHARE,
+                                        buffer0 + s_g2_off,
+                                        s_g2_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PUBLIC,
+                                        buffer0 + s_x2_pk_off,
+                                        s_x2_pk_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PROOF,
+                                        buffer0 + s_x2_pr_off,
+                                        s_x2_pr_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                /* Error didn't trigger, make test fail */
+                if (inject_error == 1) {
+                    TEST_ASSERT(
+                        !"One of the last psa_pake_input() calls should have returned the expected error.");
+                }
+            }
+
+            /* Client first round Output */
+            PSA_ASSERT(psa_pake_output(client, PSA_PAKE_STEP_KEY_SHARE,
+                                       buffer1 + buffer1_off,
+                                       512 - buffer1_off, &c_g1_len));
+            TEST_EQUAL(c_g1_len, expected_size_key_share);
+            c_g1_off = buffer1_off;
+            buffer1_off += c_g1_len;
+            PSA_ASSERT(psa_pake_output(client, PSA_PAKE_STEP_ZK_PUBLIC,
+                                       buffer1 + buffer1_off,
+                                       512 - buffer1_off, &c_x1_pk_len));
+            TEST_EQUAL(c_x1_pk_len, expected_size_zk_public);
+            c_x1_pk_off = buffer1_off;
+            buffer1_off += c_x1_pk_len;
+            PSA_ASSERT(psa_pake_output(client, PSA_PAKE_STEP_ZK_PROOF,
+                                       buffer1 + buffer1_off,
+                                       512 - buffer1_off, &c_x1_pr_len));
+            TEST_LE_U(c_x1_pr_len, max_expected_size_zk_proof);
+            c_x1_pr_off = buffer1_off;
+            buffer1_off += c_x1_pr_len;
+            PSA_ASSERT(psa_pake_output(client, PSA_PAKE_STEP_KEY_SHARE,
+                                       buffer1 + buffer1_off,
+                                       512 - buffer1_off, &c_g2_len));
+            TEST_EQUAL(c_g2_len, expected_size_key_share);
+            c_g2_off = buffer1_off;
+            buffer1_off += c_g2_len;
+            PSA_ASSERT(psa_pake_output(client, PSA_PAKE_STEP_ZK_PUBLIC,
+                                       buffer1 + buffer1_off,
+                                       512 - buffer1_off, &c_x2_pk_len));
+            TEST_EQUAL(c_x2_pk_len, expected_size_zk_public);
+            c_x2_pk_off = buffer1_off;
+            buffer1_off += c_x2_pk_len;
+            PSA_ASSERT(psa_pake_output(client, PSA_PAKE_STEP_ZK_PROOF,
+                                       buffer1 + buffer1_off,
+                                       512 - buffer1_off, &c_x2_pr_len));
+            TEST_LE_U(c_x2_pr_len, max_expected_size_zk_proof);
+            c_x2_pr_off = buffer1_off;
+            buffer1_off += c_x2_pr_len;
+
+            if (client_input_first == 0) {
+                /* Client first round Input */
+                status = psa_pake_input(client, PSA_PAKE_STEP_KEY_SHARE,
+                                        buffer0 + s_g1_off, s_g1_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PUBLIC,
+                                        buffer0 + s_x1_pk_off,
+                                        s_x1_pk_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PROOF,
+                                        buffer0 + s_x1_pr_off,
+                                        s_x1_pr_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_KEY_SHARE,
+                                        buffer0 + s_g2_off,
+                                        s_g2_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PUBLIC,
+                                        buffer0 + s_x2_pk_off,
+                                        s_x2_pk_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PROOF,
+                                        buffer0 + s_x2_pr_off,
+                                        s_x2_pr_len);
+                if (inject_error == 1 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                /* Error didn't trigger, make test fail */
+                if (inject_error == 1) {
+                    TEST_ASSERT(
+                        !"One of the last psa_pake_input() calls should have returned the expected error.");
+                }
+            }
+
+            if (inject_error == 2) {
+                buffer1[c_x1_pr_off + 12] ^= 1;
+                buffer1[c_x2_pr_off + 7] ^= 1;
+                expected_status = PSA_ERROR_DATA_INVALID;
+            }
+
+            /* Server first round Input */
+            status = psa_pake_input(server, PSA_PAKE_STEP_KEY_SHARE,
+                                    buffer1 + c_g1_off, c_g1_len);
+            if (inject_error == 2 && status != PSA_SUCCESS) {
+                TEST_EQUAL(status, expected_status);
+                break;
+            } else {
+                TEST_EQUAL(status, PSA_SUCCESS);
+            }
+
+            status = psa_pake_input(server, PSA_PAKE_STEP_ZK_PUBLIC,
+                                    buffer1 + c_x1_pk_off, c_x1_pk_len);
+            if (inject_error == 2 && status != PSA_SUCCESS) {
+                TEST_EQUAL(status, expected_status);
+                break;
+            } else {
+                TEST_EQUAL(status, PSA_SUCCESS);
+            }
+
+            status = psa_pake_input(server, PSA_PAKE_STEP_ZK_PROOF,
+                                    buffer1 + c_x1_pr_off, c_x1_pr_len);
+            if (inject_error == 2 && status != PSA_SUCCESS) {
+                TEST_EQUAL(status, expected_status);
+                break;
+            } else {
+                TEST_EQUAL(status, PSA_SUCCESS);
+            }
+
+            status = psa_pake_input(server, PSA_PAKE_STEP_KEY_SHARE,
+                                    buffer1 + c_g2_off, c_g2_len);
+            if (inject_error == 2 && status != PSA_SUCCESS) {
+                TEST_EQUAL(status, expected_status);
+                break;
+            } else {
+                TEST_EQUAL(status, PSA_SUCCESS);
+            }
+
+            status = psa_pake_input(server, PSA_PAKE_STEP_ZK_PUBLIC,
+                                    buffer1 + c_x2_pk_off, c_x2_pk_len);
+            if (inject_error == 2 && status != PSA_SUCCESS) {
+                TEST_EQUAL(status, expected_status);
+                break;
+            } else {
+                TEST_EQUAL(status, PSA_SUCCESS);
+            }
+
+            status = psa_pake_input(server, PSA_PAKE_STEP_ZK_PROOF,
+                                    buffer1 + c_x2_pr_off, c_x2_pr_len);
+            if (inject_error == 2 && status != PSA_SUCCESS) {
+                TEST_EQUAL(status, expected_status);
+                break;
+            } else {
+                TEST_EQUAL(status, PSA_SUCCESS);
+            }
+
+            /* Error didn't trigger, make test fail */
+            if (inject_error == 2) {
+                TEST_ASSERT(
+                    !"One of the last psa_pake_input() calls should have returned the expected error.");
+            }
+
+            break;
+
+        case 2:
+            /* Server second round Output */
+            buffer0_off = 0;
+
+            PSA_ASSERT(psa_pake_output(server, PSA_PAKE_STEP_KEY_SHARE,
+                                       buffer0 + buffer0_off,
+                                       512 - buffer0_off, &s_a_len));
+            TEST_EQUAL(s_a_len, expected_size_key_share);
+            s_a_off = buffer0_off;
+            buffer0_off += s_a_len;
+            PSA_ASSERT(psa_pake_output(server, PSA_PAKE_STEP_ZK_PUBLIC,
+                                       buffer0 + buffer0_off,
+                                       512 - buffer0_off, &s_x2s_pk_len));
+            TEST_EQUAL(s_x2s_pk_len, expected_size_zk_public);
+            s_x2s_pk_off = buffer0_off;
+            buffer0_off += s_x2s_pk_len;
+            PSA_ASSERT(psa_pake_output(server, PSA_PAKE_STEP_ZK_PROOF,
+                                       buffer0 + buffer0_off,
+                                       512 - buffer0_off, &s_x2s_pr_len));
+            TEST_LE_U(s_x2s_pr_len, max_expected_size_zk_proof);
+            s_x2s_pr_off = buffer0_off;
+            buffer0_off += s_x2s_pr_len;
+
+            if (inject_error == 3) {
+                buffer0[s_x2s_pk_off + 12] += 0x33;
+                expected_status = PSA_ERROR_DATA_INVALID;
+            }
+
+            if (client_input_first == 1) {
+                /* Client second round Input */
+                status = psa_pake_input(client, PSA_PAKE_STEP_KEY_SHARE,
+                                        buffer0 + s_a_off, s_a_len);
+                if (inject_error == 3 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PUBLIC,
+                                        buffer0 + s_x2s_pk_off,
+                                        s_x2s_pk_len);
+                if (inject_error == 3 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PROOF,
+                                        buffer0 + s_x2s_pr_off,
+                                        s_x2s_pr_len);
+                if (inject_error == 3 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                /* Error didn't trigger, make test fail */
+                if (inject_error == 3) {
+                    TEST_ASSERT(
+                        !"One of the last psa_pake_input() calls should have returned the expected error.");
+                }
+            }
+
+            /* Client second round Output */
+            buffer1_off = 0;
+
+            PSA_ASSERT(psa_pake_output(client, PSA_PAKE_STEP_KEY_SHARE,
+                                       buffer1 + buffer1_off,
+                                       512 - buffer1_off, &c_a_len));
+            TEST_EQUAL(c_a_len, expected_size_key_share);
+            c_a_off = buffer1_off;
+            buffer1_off += c_a_len;
+            PSA_ASSERT(psa_pake_output(client, PSA_PAKE_STEP_ZK_PUBLIC,
+                                       buffer1 + buffer1_off,
+                                       512 - buffer1_off, &c_x2s_pk_len));
+            TEST_EQUAL(c_x2s_pk_len, expected_size_zk_public);
+            c_x2s_pk_off = buffer1_off;
+            buffer1_off += c_x2s_pk_len;
+            PSA_ASSERT(psa_pake_output(client, PSA_PAKE_STEP_ZK_PROOF,
+                                       buffer1 + buffer1_off,
+                                       512 - buffer1_off, &c_x2s_pr_len));
+            TEST_LE_U(c_x2s_pr_len, max_expected_size_zk_proof);
+            c_x2s_pr_off = buffer1_off;
+            buffer1_off += c_x2s_pr_len;
+
+            if (client_input_first == 0) {
+                /* Client second round Input */
+                status = psa_pake_input(client, PSA_PAKE_STEP_KEY_SHARE,
+                                        buffer0 + s_a_off, s_a_len);
+                if (inject_error == 3 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PUBLIC,
+                                        buffer0 + s_x2s_pk_off,
+                                        s_x2s_pk_len);
+                if (inject_error == 3 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                status = psa_pake_input(client, PSA_PAKE_STEP_ZK_PROOF,
+                                        buffer0 + s_x2s_pr_off,
+                                        s_x2s_pr_len);
+                if (inject_error == 3 && status != PSA_SUCCESS) {
+                    TEST_EQUAL(status, expected_status);
+                    break;
+                } else {
+                    TEST_EQUAL(status, PSA_SUCCESS);
+                }
+
+                /* Error didn't trigger, make test fail */
+                if (inject_error == 3) {
+                    TEST_ASSERT(
+                        !"One of the last psa_pake_input() calls should have returned the expected error.");
+                }
+            }
+
+            if (inject_error == 4) {
+                buffer1[c_x2s_pk_off + 7] += 0x28;
+                expected_status = PSA_ERROR_DATA_INVALID;
+            }
+
+            /* Server second round Input */
+            status = psa_pake_input(server, PSA_PAKE_STEP_KEY_SHARE,
+                                    buffer1 + c_a_off, c_a_len);
+            if (inject_error == 4 && status != PSA_SUCCESS) {
+                TEST_EQUAL(status, expected_status);
+                break;
+            } else {
+                TEST_EQUAL(status, PSA_SUCCESS);
+            }
+
+            status = psa_pake_input(server, PSA_PAKE_STEP_ZK_PUBLIC,
+                                    buffer1 + c_x2s_pk_off, c_x2s_pk_len);
+            if (inject_error == 4 && status != PSA_SUCCESS) {
+                TEST_EQUAL(status, expected_status);
+                break;
+            } else {
+                TEST_EQUAL(status, PSA_SUCCESS);
+            }
+
+            status = psa_pake_input(server, PSA_PAKE_STEP_ZK_PROOF,
+                                    buffer1 + c_x2s_pr_off, c_x2s_pr_len);
+            if (inject_error == 4 && status != PSA_SUCCESS) {
+                TEST_EQUAL(status, expected_status);
+                break;
+            } else {
+                TEST_EQUAL(status, PSA_SUCCESS);
+            }
+
+            /* Error didn't trigger, make test fail */
+            if (inject_error == 4) {
+                TEST_ASSERT(
+                    !"One of the last psa_pake_input() calls should have returned the expected error.");
+            }
+
+            break;
+
+    }
+
+exit:
+    mbedtls_free(buffer0);
+    mbedtls_free(buffer1);
+}
+#endif /* PSA_WANT_ALG_JPAKE */
+
+static int setup_key_production_parameters(
+    psa_key_production_parameters_t **params, size_t *params_data_length,
+    int flags_arg, const data_t *params_data)
+{
+    *params_data_length = params_data->len;
+    /* If there are N bytes of padding at the end of
+     * psa_key_production_parameters_t, then it's enough to allocate
+     * MIN(sizeof(psa_key_production_parameters_t),
+     *     offsetof(psa_key_production_parameters_t, data) + params_data_length).
+     *
+     * For simplicity, here, we allocate up to N more bytes than necessary.
+     * In practice, the current layout of psa_key_production_parameters_t
+     * makes padding extremely unlikely, so we don't worry about testing
+     * that the library code doesn't try to access these extra N bytes.
+     */
+    *params = mbedtls_calloc(1, sizeof(**params) + *params_data_length);
+    TEST_ASSERT(*params != NULL);
+    (*params)->flags = (uint32_t) flags_arg;
+    memcpy((*params)->data, params_data->x, params_data->len);
+    return 1;
+exit:
+    return 0;
+}
+
+#if defined(PSA_WANT_KEY_TYPE_RSA_KEY_PAIR_GENERATE)
+static int rsa_test_e(mbedtls_svc_key_id_t key,
+                      size_t bits,
+                      const data_t *e_arg)
+{
+    uint8_t *exported = NULL;
+    size_t exported_size =
+        PSA_EXPORT_KEY_OUTPUT_SIZE(PSA_KEY_TYPE_RSA_PUBLIC_KEY, bits);
+    size_t exported_length = SIZE_MAX;
+    int ok = 0;
+
+    TEST_CALLOC(exported, exported_size);
+    PSA_ASSERT(psa_export_public_key(key,
+                                     exported, exported_size,
+                                     &exported_length));
+    uint8_t *p = exported;
+    uint8_t *end = exported + exported_length;
+    size_t len;
+    /*   RSAPublicKey ::= SEQUENCE {
+     *      modulus            INTEGER,    -- n
+     *      publicExponent     INTEGER  }  -- e
+     */
+    TEST_EQUAL(0, mbedtls_asn1_get_tag(&p, end, &len,
+                                       MBEDTLS_ASN1_SEQUENCE |
+                                       MBEDTLS_ASN1_CONSTRUCTED));
+    TEST_ASSERT(mbedtls_test_asn1_skip_integer(&p, end, bits, bits, 1));
+    TEST_EQUAL(0, mbedtls_asn1_get_tag(&p, end, &len,
+                                       MBEDTLS_ASN1_INTEGER));
+    if (len >= 1 && p[0] == 0) {
+        ++p;
+        --len;
+    }
+    if (e_arg->len == 0) {
+        TEST_EQUAL(len, 3);
+        TEST_EQUAL(p[0], 1);
+        TEST_EQUAL(p[1], 0);
+        TEST_EQUAL(p[2], 1);
+    } else {
+        const uint8_t *expected = e_arg->x;
+        size_t expected_len = e_arg->len;
+        while (expected_len > 0 && *expected == 0) {
+            ++expected;
+            --expected_len;
+        }
+        TEST_MEMORY_COMPARE(p, len, expected, expected_len);
+    }
+    ok = 1;
+
+exit:
+    mbedtls_free(exported);
+    return ok;
+}
+#endif /* PSA_WANT_KEY_TYPE_RSA_KEY_PAIR_GENERATE */
+
+/* END_HEADER */
+
+/* BEGIN_DEPENDENCIES
+ * depends_on:MBEDTLS_PSA_CRYPTO_C
+ * END_DEPENDENCIES
+ */
+
+
+/* BEGIN_CASE */
+void key_derivation_init()
+{
+    /* Test each valid way of initializing the object, except for `= {0}`, as
+     * Clang 5 complains when `-Wmissing-field-initializers` is used, even
+     * though it's OK by the C standard. We could test for this, but we'd need
+     * to suppress the Clang warning for the test. */
+    size_t capacity;
+    psa_key_derivation_operation_t func = psa_key_derivation_operation_init();
+    psa_key_derivation_operation_t init = PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_key_derivation_operation_t zero;
+
+    memset(&zero, 0, sizeof(zero));
+
+    /* A default operation should not be able to report its capacity. */
+    TEST_EQUAL(psa_key_derivation_get_capacity(&func, &capacity),
+               PSA_ERROR_BAD_STATE);
+    TEST_EQUAL(psa_key_derivation_get_capacity(&init, &capacity),
+               PSA_ERROR_BAD_STATE);
+    TEST_EQUAL(psa_key_derivation_get_capacity(&zero, &capacity),
+               PSA_ERROR_BAD_STATE);
+
+    /* A default operation should be abortable without error. */
+    PSA_ASSERT(psa_key_derivation_abort(&func));
+    PSA_ASSERT(psa_key_derivation_abort(&init));
+    PSA_ASSERT(psa_key_derivation_abort(&zero));
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void derive_setup(int alg_arg, int expected_status_arg)
+{
+    psa_algorithm_t alg = alg_arg;
+    psa_status_t expected_status = expected_status_arg;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    TEST_EQUAL(psa_key_derivation_setup(&operation, alg),
+               expected_status);
+
+exit:
+    psa_key_derivation_abort(&operation);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void derive_set_capacity(int alg_arg, int capacity_arg,
+                         int expected_status_arg)
+{
+    psa_algorithm_t alg = alg_arg;
+    size_t capacity = capacity_arg;
+    psa_status_t expected_status = expected_status_arg;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    PSA_ASSERT(psa_key_derivation_setup(&operation, alg));
+
+    TEST_EQUAL(psa_key_derivation_set_capacity(&operation, capacity),
+               expected_status);
+
+exit:
+    psa_key_derivation_abort(&operation);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void parse_binary_string_test(data_t *input, int output)
+{
+    uint64_t value;
+    value = mbedtls_test_parse_binary_string(input);
+    TEST_EQUAL(value, output);
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void derive_input(int alg_arg,
+                  int step_arg1, int key_type_arg1, data_t *input1,
+                  int expected_status_arg1,
+                  int step_arg2, int key_type_arg2, data_t *input2,
+                  int expected_status_arg2,
+                  int step_arg3, int key_type_arg3, data_t *input3,
+                  int expected_status_arg3,
+                  int output_key_type_arg, int expected_output_status_arg)
+{
+    psa_algorithm_t alg = alg_arg;
+    psa_key_derivation_step_t steps[] = { step_arg1, step_arg2, step_arg3 };
+    uint32_t key_types[] = { key_type_arg1, key_type_arg2, key_type_arg3 };
+    psa_status_t expected_statuses[] = { expected_status_arg1,
+                                         expected_status_arg2,
+                                         expected_status_arg3 };
+    data_t *inputs[] = { input1, input2, input3 };
+    mbedtls_svc_key_id_t keys[] = { MBEDTLS_SVC_KEY_ID_INIT,
+                                    MBEDTLS_SVC_KEY_ID_INIT,
+                                    MBEDTLS_SVC_KEY_ID_INIT };
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    size_t i;
+    psa_key_type_t output_key_type = output_key_type_arg;
+    mbedtls_svc_key_id_t output_key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_status_t expected_output_status = expected_output_status_arg;
+    psa_status_t actual_output_status;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&attributes, alg);
+
+    PSA_ASSERT(psa_key_derivation_setup(&operation, alg));
+
+    for (i = 0; i < ARRAY_LENGTH(steps); i++) {
+        mbedtls_test_set_step(i);
+        if (steps[i] == 0) {
+            /* Skip this step */
+        } else if (((psa_key_type_t) key_types[i]) != PSA_KEY_TYPE_NONE &&
+                   key_types[i] != INPUT_INTEGER) {
+            psa_set_key_type(&attributes, ((psa_key_type_t) key_types[i]));
+            PSA_ASSERT(psa_import_key(&attributes,
+                                      inputs[i]->x, inputs[i]->len,
+                                      &keys[i]));
+            if (PSA_KEY_TYPE_IS_KEY_PAIR((psa_key_type_t) key_types[i]) &&
+                steps[i] == PSA_KEY_DERIVATION_INPUT_SECRET) {
+                // When taking a private key as secret input, use key agreement
+                // to add the shared secret to the derivation
+                TEST_EQUAL(mbedtls_test_psa_key_agreement_with_self(
+                               &operation, keys[i], 0),
+                           expected_statuses[i]);
+            } else {
+                TEST_EQUAL(psa_key_derivation_input_key(&operation, steps[i],
+                                                        keys[i]),
+                           expected_statuses[i]);
+            }
+        } else {
+            if (key_types[i] == INPUT_INTEGER) {
+                TEST_EQUAL(psa_key_derivation_input_integer(
+                               &operation, steps[i],
+                               mbedtls_test_parse_binary_string(inputs[i])),
+                           expected_statuses[i]);
+            } else {
+                TEST_EQUAL(psa_key_derivation_input_bytes(
+                               &operation, steps[i],
+                               inputs[i]->x, inputs[i]->len),
+                           expected_statuses[i]);
+            }
+        }
+    }
+
+    if (output_key_type != PSA_KEY_TYPE_NONE) {
+        psa_reset_key_attributes(&attributes);
+        psa_set_key_type(&attributes, output_key_type);
+        psa_set_key_bits(&attributes, 8);
+        actual_output_status =
+            psa_key_derivation_output_key(&attributes, &operation,
+                                          &output_key);
+    } else {
+        uint8_t buffer[1];
+        actual_output_status =
+            psa_key_derivation_output_bytes(&operation,
+                                            buffer, sizeof(buffer));
+    }
+    TEST_EQUAL(actual_output_status, expected_output_status);
+
+exit:
+    psa_key_derivation_abort(&operation);
+    for (i = 0; i < ARRAY_LENGTH(keys); i++) {
+        psa_destroy_key(keys[i]);
+    }
+    psa_destroy_key(output_key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE*/
+void derive_input_invalid_cost(int alg_arg, int64_t cost)
+{
+    psa_algorithm_t alg = alg_arg;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+    PSA_ASSERT(psa_key_derivation_setup(&operation, alg));
+
+    TEST_EQUAL(psa_key_derivation_input_integer(&operation,
+                                                PSA_KEY_DERIVATION_INPUT_COST,
+                                                cost),
+               PSA_ERROR_NOT_SUPPORTED);
+
+exit:
+    psa_key_derivation_abort(&operation);
+    PSA_DONE();
+}
+/* END_CASE*/
+
+/* BEGIN_CASE */
+void derive_over_capacity(int alg_arg)
+{
+    psa_algorithm_t alg = alg_arg;
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    size_t key_type = PSA_KEY_TYPE_DERIVE;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    unsigned char input1[] = "Input 1";
+    size_t input1_length = sizeof(input1);
+    unsigned char input2[] = "Input 2";
+    size_t input2_length = sizeof(input2);
+    uint8_t buffer[42];
+    size_t capacity = sizeof(buffer);
+    const uint8_t key_data[22] = { 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+                                   0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+                                   0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b };
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, key_type);
+
+    PSA_ASSERT(psa_import_key(&attributes,
+                              key_data, sizeof(key_data),
+                              &key));
+
+    /* valid key derivation */
+    if (!mbedtls_test_psa_setup_key_derivation_wrap(&operation, key, alg,
+                                                    input1, input1_length,
+                                                    input2, input2_length,
+                                                    capacity, 0)) {
+        goto exit;
+    }
+
+    /* state of operation shouldn't allow additional generation */
+    TEST_EQUAL(psa_key_derivation_setup(&operation, alg),
+               PSA_ERROR_BAD_STATE);
+
+    PSA_ASSERT(psa_key_derivation_output_bytes(&operation, buffer, capacity));
+
+    TEST_EQUAL(psa_key_derivation_output_bytes(&operation, buffer, capacity),
+               PSA_ERROR_INSUFFICIENT_DATA);
+
+exit:
+    psa_key_derivation_abort(&operation);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void derive_actions_without_setup()
+{
+    uint8_t output_buffer[16];
+    size_t buffer_size = 16;
+    size_t capacity = 0;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+
+    TEST_ASSERT(psa_key_derivation_output_bytes(&operation,
+                                                output_buffer, buffer_size)
+                == PSA_ERROR_BAD_STATE);
+
+    TEST_ASSERT(psa_key_derivation_get_capacity(&operation, &capacity)
+                == PSA_ERROR_BAD_STATE);
+
+    PSA_ASSERT(psa_key_derivation_abort(&operation));
+
+    TEST_ASSERT(psa_key_derivation_output_bytes(&operation,
+                                                output_buffer, buffer_size)
+                == PSA_ERROR_BAD_STATE);
+
+    TEST_ASSERT(psa_key_derivation_get_capacity(&operation, &capacity)
+                == PSA_ERROR_BAD_STATE);
+
+exit:
+    psa_key_derivation_abort(&operation);
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void derive_output(int alg_arg,
+                   int step1_arg, data_t *input1, int expected_status_arg1,
+                   int step2_arg, data_t *input2, int expected_status_arg2,
+                   int step3_arg, data_t *input3, int expected_status_arg3,
+                   int step4_arg, data_t *input4, int expected_status_arg4,
+                   data_t *key_agreement_peer_key,
+                   int requested_capacity_arg,
+                   data_t *expected_output1,
+                   data_t *expected_output2,
+                   int other_key_input_type,
+                   int key_input_type,
+                   int derive_type)
+{
+    psa_algorithm_t alg = alg_arg;
+    psa_key_derivation_step_t steps[] = { step1_arg, step2_arg, step3_arg, step4_arg };
+    data_t *inputs[] = { input1, input2, input3, input4 };
+    mbedtls_svc_key_id_t keys[] = { MBEDTLS_SVC_KEY_ID_INIT,
+                                    MBEDTLS_SVC_KEY_ID_INIT,
+                                    MBEDTLS_SVC_KEY_ID_INIT,
+                                    MBEDTLS_SVC_KEY_ID_INIT };
+    psa_status_t statuses[] = { expected_status_arg1, expected_status_arg2,
+                                expected_status_arg3, expected_status_arg4 };
+    size_t requested_capacity = requested_capacity_arg;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    uint8_t *expected_outputs[2] =
+    { expected_output1->x, expected_output2->x };
+    size_t output_sizes[2] =
+    { expected_output1->len, expected_output2->len };
+    size_t output_buffer_size = 0;
+    uint8_t *output_buffer = NULL;
+    size_t expected_capacity;
+    size_t current_capacity;
+    psa_key_attributes_t attributes1 = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_attributes_t attributes2 = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_attributes_t attributes3 = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_attributes_t attributes4 = PSA_KEY_ATTRIBUTES_INIT;
+    mbedtls_svc_key_id_t derived_key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_status_t status;
+    size_t i;
+
+    for (i = 0; i < ARRAY_LENGTH(expected_outputs); i++) {
+        if (output_sizes[i] > output_buffer_size) {
+            output_buffer_size = output_sizes[i];
+        }
+        if (output_sizes[i] == 0) {
+            expected_outputs[i] = NULL;
+        }
+    }
+    TEST_CALLOC(output_buffer, output_buffer_size);
+    PSA_ASSERT(psa_crypto_init());
+
+    /* Extraction phase. */
+    PSA_ASSERT(psa_key_derivation_setup(&operation, alg));
+    PSA_ASSERT(psa_key_derivation_set_capacity(&operation,
+                                               requested_capacity));
+    for (i = 0; i < ARRAY_LENGTH(steps); i++) {
+        switch (steps[i]) {
+            case 0:
+                break;
+            case PSA_KEY_DERIVATION_INPUT_COST:
+                TEST_EQUAL(psa_key_derivation_input_integer(
+                               &operation, steps[i],
+                               mbedtls_test_parse_binary_string(inputs[i])),
+                           statuses[i]);
+                if (statuses[i] != PSA_SUCCESS) {
+                    goto exit;
+                }
+                break;
+            case PSA_KEY_DERIVATION_INPUT_PASSWORD:
+            case PSA_KEY_DERIVATION_INPUT_SECRET:
+                switch (key_input_type) {
+                    case 0: // input bytes
+                        TEST_EQUAL(psa_key_derivation_input_bytes(
+                                       &operation, steps[i],
+                                       inputs[i]->x, inputs[i]->len),
+                                   statuses[i]);
+
+                        if (statuses[i] != PSA_SUCCESS) {
+                            goto exit;
+                        }
+                        break;
+                    case 1: // input key
+                        psa_set_key_usage_flags(&attributes1, PSA_KEY_USAGE_DERIVE);
+                        psa_set_key_algorithm(&attributes1, alg);
+                        psa_set_key_type(&attributes1, PSA_KEY_TYPE_DERIVE);
+
+                        PSA_ASSERT(psa_import_key(&attributes1,
+                                                  inputs[i]->x, inputs[i]->len,
+                                                  &keys[i]));
+
+                        if (PSA_ALG_IS_TLS12_PSK_TO_MS(alg)) {
+                            PSA_ASSERT(psa_get_key_attributes(keys[i], &attributes1));
+                            TEST_LE_U(PSA_BITS_TO_BYTES(psa_get_key_bits(&attributes1)),
+                                      PSA_TLS12_PSK_TO_MS_PSK_MAX_SIZE);
+                        }
+
+                        TEST_EQUAL(psa_key_derivation_input_key(&operation,
+                                                                steps[i],
+                                                                keys[i]),
+                                   statuses[i]);
+
+                        if (statuses[i] != PSA_SUCCESS) {
+                            goto exit;
+                        }
+                        break;
+                    default:
+                        TEST_FAIL("default case not supported");
+                        break;
+                }
+                break;
+            case PSA_KEY_DERIVATION_INPUT_OTHER_SECRET:
+                switch (other_key_input_type) {
+                    case 0: // input bytes
+                        TEST_EQUAL(psa_key_derivation_input_bytes(&operation,
+                                                                  steps[i],
+                                                                  inputs[i]->x,
+                                                                  inputs[i]->len),
+                                   statuses[i]);
+                        break;
+                    case 1: // input key, type DERIVE
+                    case 11: // input key, type RAW
+                        psa_set_key_usage_flags(&attributes2, PSA_KEY_USAGE_DERIVE);
+                        psa_set_key_algorithm(&attributes2, alg);
+                        psa_set_key_type(&attributes2, PSA_KEY_TYPE_DERIVE);
+
+                        // other secret of type RAW_DATA passed with input_key
+                        if (other_key_input_type == 11) {
+                            psa_set_key_type(&attributes2, PSA_KEY_TYPE_RAW_DATA);
+                        }
+
+                        PSA_ASSERT(psa_import_key(&attributes2,
+                                                  inputs[i]->x, inputs[i]->len,
+                                                  &keys[i]));
+
+                        TEST_EQUAL(psa_key_derivation_input_key(&operation,
+                                                                steps[i],
+                                                                keys[i]),
+                                   statuses[i]);
+                        break;
+                    case 2: // key agreement
+                        psa_set_key_usage_flags(&attributes3, PSA_KEY_USAGE_DERIVE);
+                        psa_set_key_algorithm(&attributes3, alg);
+                        psa_set_key_type(&attributes3,
+                                         PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+
+                        PSA_ASSERT(psa_import_key(&attributes3,
+                                                  inputs[i]->x, inputs[i]->len,
+                                                  &keys[i]));
+
+                        TEST_EQUAL(psa_key_derivation_key_agreement(
+                                       &operation,
+                                       PSA_KEY_DERIVATION_INPUT_OTHER_SECRET,
+                                       keys[i], key_agreement_peer_key->x,
+                                       key_agreement_peer_key->len), statuses[i]);
+                        break;
+                    default:
+                        TEST_FAIL("default case not supported");
+                        break;
+                }
+
+                if (statuses[i] != PSA_SUCCESS) {
+                    goto exit;
+                }
+                break;
+            default:
+                TEST_EQUAL(psa_key_derivation_input_bytes(
+                               &operation, steps[i],
+                               inputs[i]->x, inputs[i]->len), statuses[i]);
+
+                if (statuses[i] != PSA_SUCCESS) {
+                    goto exit;
+                }
+                break;
+        }
+    }
+
+    PSA_ASSERT(psa_key_derivation_get_capacity(&operation,
+                                               &current_capacity));
+    TEST_EQUAL(current_capacity, requested_capacity);
+    expected_capacity = requested_capacity;
+
+    if (derive_type == 1) { // output key
+        psa_status_t expected_status = PSA_ERROR_NOT_PERMITTED;
+
+        /* For output key derivation secret must be provided using
+           input key, otherwise operation is not permitted. */
+        if (key_input_type == 1) {
+            expected_status = PSA_SUCCESS;
+        }
+
+        psa_set_key_usage_flags(&attributes4, PSA_KEY_USAGE_EXPORT);
+        psa_set_key_algorithm(&attributes4, alg);
+        psa_set_key_type(&attributes4, PSA_KEY_TYPE_DERIVE);
+        psa_set_key_bits(&attributes4, PSA_BYTES_TO_BITS(requested_capacity));
+
+        TEST_EQUAL(psa_key_derivation_output_key(&attributes4, &operation,
+                                                 &derived_key), expected_status);
+    } else { // output bytes
+        /* Expansion phase. */
+        for (i = 0; i < ARRAY_LENGTH(expected_outputs); i++) {
+            /* Read some bytes. */
+            status = psa_key_derivation_output_bytes(&operation,
+                                                     output_buffer, output_sizes[i]);
+            if (expected_capacity == 0 && output_sizes[i] == 0) {
+                /* Reading 0 bytes when 0 bytes are available can go either way. */
+                TEST_ASSERT(status == PSA_SUCCESS ||
+                            status == PSA_ERROR_INSUFFICIENT_DATA);
+                continue;
+            } else if (expected_capacity == 0 ||
+                       output_sizes[i] > expected_capacity) {
+                /* Capacity exceeded. */
+                TEST_EQUAL(status, PSA_ERROR_INSUFFICIENT_DATA);
+                expected_capacity = 0;
+                continue;
+            }
+            /* Success. Check the read data. */
+            PSA_ASSERT(status);
+            if (output_sizes[i] != 0) {
+                TEST_MEMORY_COMPARE(output_buffer, output_sizes[i],
+                                    expected_outputs[i], output_sizes[i]);
+            }
+            /* Check the operation status. */
+            expected_capacity -= output_sizes[i];
+            PSA_ASSERT(psa_key_derivation_get_capacity(&operation,
+                                                       &current_capacity));
+            TEST_EQUAL(expected_capacity, current_capacity);
+        }
+    }
+    PSA_ASSERT(psa_key_derivation_abort(&operation));
+
+exit:
+    mbedtls_free(output_buffer);
+    psa_key_derivation_abort(&operation);
+    for (i = 0; i < ARRAY_LENGTH(keys); i++) {
+        psa_destroy_key(keys[i]);
+    }
+    psa_destroy_key(derived_key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void derive_full(int alg_arg,
+                 data_t *key_data,
+                 data_t *input1,
+                 data_t *input2,
+                 int requested_capacity_arg)
+{
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_algorithm_t alg = alg_arg;
+    size_t requested_capacity = requested_capacity_arg;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    unsigned char output_buffer[32];
+    size_t expected_capacity = requested_capacity;
+    size_t current_capacity;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_DERIVE);
+
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &key));
+
+    if (!mbedtls_test_psa_setup_key_derivation_wrap(&operation, key, alg,
+                                                    input1->x, input1->len,
+                                                    input2->x, input2->len,
+                                                    requested_capacity, 0)) {
+        goto exit;
+    }
+
+    PSA_ASSERT(psa_key_derivation_get_capacity(&operation,
+                                               &current_capacity));
+    TEST_EQUAL(current_capacity, expected_capacity);
+
+    /* Expansion phase. */
+    while (current_capacity > 0) {
+        size_t read_size = sizeof(output_buffer);
+        if (read_size > current_capacity) {
+            read_size = current_capacity;
+        }
+        PSA_ASSERT(psa_key_derivation_output_bytes(&operation,
+                                                   output_buffer,
+                                                   read_size));
+        expected_capacity -= read_size;
+        PSA_ASSERT(psa_key_derivation_get_capacity(&operation,
+                                                   &current_capacity));
+        TEST_EQUAL(current_capacity, expected_capacity);
+    }
+
+    /* Check that the operation refuses to go over capacity. */
+    TEST_EQUAL(psa_key_derivation_output_bytes(&operation, output_buffer, 1),
+               PSA_ERROR_INSUFFICIENT_DATA);
+
+    PSA_ASSERT(psa_key_derivation_abort(&operation));
+
+exit:
+    psa_key_derivation_abort(&operation);
+    psa_destroy_key(key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:PSA_WANT_ALG_SHA_256:PSA_WANT_ALG_TLS12_ECJPAKE_TO_PMS */
+void derive_ecjpake_to_pms(data_t *input, int expected_input_status_arg,
+                           int derivation_step,
+                           int capacity, int expected_capacity_status_arg,
+                           data_t *expected_output,
+                           int expected_output_status_arg)
+{
+    psa_algorithm_t alg = PSA_ALG_TLS12_ECJPAKE_TO_PMS;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_key_derivation_step_t step = (psa_key_derivation_step_t) derivation_step;
+    uint8_t *output_buffer = NULL;
+    psa_status_t status;
+    psa_status_t expected_input_status = (psa_status_t) expected_input_status_arg;
+    psa_status_t expected_capacity_status = (psa_status_t) expected_capacity_status_arg;
+    psa_status_t expected_output_status = (psa_status_t) expected_output_status_arg;
+
+    TEST_CALLOC(output_buffer, expected_output->len);
+    PSA_ASSERT(psa_crypto_init());
+
+    PSA_ASSERT(psa_key_derivation_setup(&operation, alg));
+    TEST_EQUAL(psa_key_derivation_set_capacity(&operation, capacity),
+               expected_capacity_status);
+
+    TEST_EQUAL(psa_key_derivation_input_bytes(&operation,
+                                              step, input->x, input->len),
+               expected_input_status);
+
+    if (((psa_status_t) expected_input_status) != PSA_SUCCESS) {
+        goto exit;
+    }
+
+    status = psa_key_derivation_output_bytes(&operation, output_buffer,
+                                             expected_output->len);
+
+    TEST_EQUAL(status, expected_output_status);
+    if (expected_output->len != 0 && expected_output_status == PSA_SUCCESS) {
+        TEST_MEMORY_COMPARE(output_buffer, expected_output->len, expected_output->x,
+                            expected_output->len);
+    }
+
+exit:
+    mbedtls_free(output_buffer);
+    psa_key_derivation_abort(&operation);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void derive_key_exercise(int alg_arg,
+                         data_t *key_data,
+                         data_t *input1,
+                         data_t *input2,
+                         int derived_type_arg,
+                         int derived_bits_arg,
+                         int derived_usage_arg,
+                         int derived_alg_arg)
+{
+    mbedtls_svc_key_id_t base_key = MBEDTLS_SVC_KEY_ID_INIT;
+    mbedtls_svc_key_id_t derived_key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_algorithm_t alg = alg_arg;
+    psa_key_type_t derived_type = derived_type_arg;
+    size_t derived_bits = derived_bits_arg;
+    psa_key_usage_t derived_usage = derived_usage_arg;
+    psa_algorithm_t derived_alg = derived_alg_arg;
+    size_t capacity = PSA_BITS_TO_BYTES(derived_bits);
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_attributes_t got_attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_DERIVE);
+    PSA_ASSERT(psa_import_key(&attributes, key_data->x, key_data->len,
+                              &base_key));
+
+    /* Derive a key. */
+    if (!mbedtls_test_psa_setup_key_derivation_wrap(&operation, base_key, alg,
+                                                    input1->x, input1->len,
+                                                    input2->x, input2->len,
+                                                    capacity, 0)) {
+        goto exit;
+    }
+
+    psa_set_key_usage_flags(&attributes, derived_usage);
+    psa_set_key_algorithm(&attributes, derived_alg);
+    psa_set_key_type(&attributes, derived_type);
+    psa_set_key_bits(&attributes, derived_bits);
+    PSA_ASSERT(psa_key_derivation_output_key(&attributes, &operation,
+                                             &derived_key));
+
+    /* Test the key information */
+    PSA_ASSERT(psa_get_key_attributes(derived_key, &got_attributes));
+    TEST_EQUAL(psa_get_key_type(&got_attributes), derived_type);
+    TEST_EQUAL(psa_get_key_bits(&got_attributes), derived_bits);
+
+    /* Exercise the derived key. */
+    if (!mbedtls_test_psa_exercise_key(derived_key, derived_usage, derived_alg, 0)) {
+        goto exit;
+    }
+
+exit:
+    /*
+     * Key attributes may have been returned by psa_get_key_attributes()
+     * thus reset them as required.
+     */
+    psa_reset_key_attributes(&got_attributes);
+
+    psa_key_derivation_abort(&operation);
+    psa_destroy_key(base_key);
+    psa_destroy_key(derived_key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void derive_key_export(int alg_arg,
+                       data_t *key_data,
+                       data_t *input1,
+                       data_t *input2,
+                       int bytes1_arg,
+                       int bytes2_arg)
+{
+    mbedtls_svc_key_id_t base_key = MBEDTLS_SVC_KEY_ID_INIT;
+    mbedtls_svc_key_id_t derived_key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_algorithm_t alg = alg_arg;
+    size_t bytes1 = bytes1_arg;
+    size_t bytes2 = bytes2_arg;
+    size_t capacity = bytes1 + bytes2;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    uint8_t *output_buffer = NULL;
+    uint8_t *export_buffer = NULL;
+    psa_key_attributes_t base_attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_attributes_t derived_attributes = PSA_KEY_ATTRIBUTES_INIT;
+    size_t length;
+
+    TEST_CALLOC(output_buffer, capacity);
+    TEST_CALLOC(export_buffer, capacity);
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&base_attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&base_attributes, alg);
+    psa_set_key_type(&base_attributes, PSA_KEY_TYPE_DERIVE);
+    PSA_ASSERT(psa_import_key(&base_attributes, key_data->x, key_data->len,
+                              &base_key));
+
+    /* Derive some material and output it. */
+    if (!mbedtls_test_psa_setup_key_derivation_wrap(&operation, base_key, alg,
+                                                    input1->x, input1->len,
+                                                    input2->x, input2->len,
+                                                    capacity, 0)) {
+        goto exit;
+    }
+
+    PSA_ASSERT(psa_key_derivation_output_bytes(&operation,
+                                               output_buffer,
+                                               capacity));
+    PSA_ASSERT(psa_key_derivation_abort(&operation));
+
+    /* Derive the same output again, but this time store it in key objects. */
+    if (!mbedtls_test_psa_setup_key_derivation_wrap(&operation, base_key, alg,
+                                                    input1->x, input1->len,
+                                                    input2->x, input2->len,
+                                                    capacity, 0)) {
+        goto exit;
+    }
+
+    psa_set_key_usage_flags(&derived_attributes, PSA_KEY_USAGE_EXPORT);
+    psa_set_key_algorithm(&derived_attributes, 0);
+    psa_set_key_type(&derived_attributes, PSA_KEY_TYPE_RAW_DATA);
+    psa_set_key_bits(&derived_attributes, PSA_BYTES_TO_BITS(bytes1));
+    PSA_ASSERT(psa_key_derivation_output_key(&derived_attributes, &operation,
+                                             &derived_key));
+    PSA_ASSERT(psa_export_key(derived_key,
+                              export_buffer, bytes1,
+                              &length));
+    TEST_EQUAL(length, bytes1);
+    PSA_ASSERT(psa_destroy_key(derived_key));
+    psa_set_key_bits(&derived_attributes, PSA_BYTES_TO_BITS(bytes2));
+    PSA_ASSERT(psa_key_derivation_output_key(&derived_attributes, &operation,
+                                             &derived_key));
+    PSA_ASSERT(psa_export_key(derived_key,
+                              export_buffer + bytes1, bytes2,
+                              &length));
+    TEST_EQUAL(length, bytes2);
+
+    /* Compare the outputs from the two runs. */
+    TEST_MEMORY_COMPARE(output_buffer, bytes1 + bytes2,
+                        export_buffer, capacity);
+
+exit:
+    mbedtls_free(output_buffer);
+    mbedtls_free(export_buffer);
+    psa_key_derivation_abort(&operation);
+    psa_destroy_key(base_key);
+    psa_destroy_key(derived_key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void derive_key_type(int alg_arg,
+                     data_t *key_data,
+                     data_t *input1,
+                     data_t *input2,
+                     int key_type_arg, int bits_arg,
+                     data_t *expected_export)
+{
+    mbedtls_svc_key_id_t base_key = MBEDTLS_SVC_KEY_ID_INIT;
+    mbedtls_svc_key_id_t derived_key = MBEDTLS_SVC_KEY_ID_INIT;
+    const psa_algorithm_t alg = alg_arg;
+    const psa_key_type_t key_type = key_type_arg;
+    const size_t bits = bits_arg;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    const size_t export_buffer_size =
+        PSA_EXPORT_KEY_OUTPUT_SIZE(key_type, bits);
+    uint8_t *export_buffer = NULL;
+    psa_key_attributes_t base_attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_attributes_t derived_attributes = PSA_KEY_ATTRIBUTES_INIT;
+    size_t export_length;
+
+    TEST_CALLOC(export_buffer, export_buffer_size);
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&base_attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&base_attributes, alg);
+    psa_set_key_type(&base_attributes, PSA_KEY_TYPE_DERIVE);
+    PSA_ASSERT(psa_import_key(&base_attributes, key_data->x, key_data->len,
+                              &base_key));
+
+    if (mbedtls_test_psa_setup_key_derivation_wrap(
+            &operation, base_key, alg,
+            input1->x, input1->len,
+            input2->x, input2->len,
+            PSA_KEY_DERIVATION_UNLIMITED_CAPACITY, 0) == 0) {
+        goto exit;
+    }
+
+    psa_set_key_usage_flags(&derived_attributes, PSA_KEY_USAGE_EXPORT);
+    psa_set_key_algorithm(&derived_attributes, 0);
+    psa_set_key_type(&derived_attributes, key_type);
+    psa_set_key_bits(&derived_attributes, bits);
+    PSA_ASSERT(psa_key_derivation_output_key(&derived_attributes, &operation,
+                                             &derived_key));
+
+    PSA_ASSERT(psa_export_key(derived_key,
+                              export_buffer, export_buffer_size,
+                              &export_length));
+    TEST_MEMORY_COMPARE(export_buffer, export_length,
+                        expected_export->x, expected_export->len);
+
+exit:
+    mbedtls_free(export_buffer);
+    psa_key_derivation_abort(&operation);
+    psa_destroy_key(base_key);
+    psa_destroy_key(derived_key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void derive_key_ext(int alg_arg,
+                    data_t *key_data,
+                    data_t *input1,
+                    data_t *input2,
+                    int key_type_arg, int bits_arg,
+                    int flags_arg,
+                    data_t *params_data,
+                    psa_status_t expected_status,
+                    data_t *expected_export)
+{
+    mbedtls_svc_key_id_t base_key = MBEDTLS_SVC_KEY_ID_INIT;
+    mbedtls_svc_key_id_t derived_key = MBEDTLS_SVC_KEY_ID_INIT;
+    const psa_algorithm_t alg = alg_arg;
+    const psa_key_type_t key_type = key_type_arg;
+    const size_t bits = bits_arg;
+    psa_key_production_parameters_t *params = NULL;
+    size_t params_data_length = 0;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    const size_t export_buffer_size =
+        PSA_EXPORT_KEY_OUTPUT_SIZE(key_type, bits);
+    uint8_t *export_buffer = NULL;
+    psa_key_attributes_t base_attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_attributes_t derived_attributes = PSA_KEY_ATTRIBUTES_INIT;
+    size_t export_length;
+
+    TEST_CALLOC(export_buffer, export_buffer_size);
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&base_attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&base_attributes, alg);
+    psa_set_key_type(&base_attributes, PSA_KEY_TYPE_DERIVE);
+    PSA_ASSERT(psa_import_key(&base_attributes, key_data->x, key_data->len,
+                              &base_key));
+
+    if (mbedtls_test_psa_setup_key_derivation_wrap(
+            &operation, base_key, alg,
+            input1->x, input1->len,
+            input2->x, input2->len,
+            PSA_KEY_DERIVATION_UNLIMITED_CAPACITY, 0) == 0) {
+        goto exit;
+    }
+
+    psa_set_key_usage_flags(&derived_attributes, PSA_KEY_USAGE_EXPORT);
+    psa_set_key_algorithm(&derived_attributes, 0);
+    psa_set_key_type(&derived_attributes, key_type);
+    psa_set_key_bits(&derived_attributes, bits);
+    if (!setup_key_production_parameters(&params, &params_data_length,
+                                         flags_arg, params_data)) {
+        goto exit;
+    }
+
+    TEST_EQUAL(psa_key_derivation_output_key_ext(&derived_attributes, &operation,
+                                                 params, params_data_length,
+                                                 &derived_key),
+               expected_status);
+
+    if (expected_status == PSA_SUCCESS) {
+        PSA_ASSERT(psa_export_key(derived_key,
+                                  export_buffer, export_buffer_size,
+                                  &export_length));
+        TEST_MEMORY_COMPARE(export_buffer, export_length,
+                            expected_export->x, expected_export->len);
+    }
+
+exit:
+    mbedtls_free(export_buffer);
+    mbedtls_free(params);
+    psa_key_derivation_abort(&operation);
+    psa_destroy_key(base_key);
+    psa_destroy_key(derived_key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void derive_key(int alg_arg,
+                data_t *key_data, data_t *input1, data_t *input2,
+                int type_arg, int bits_arg,
+                int expected_status_arg,
+                int is_large_output)
+{
+    mbedtls_svc_key_id_t base_key = MBEDTLS_SVC_KEY_ID_INIT;
+    mbedtls_svc_key_id_t derived_key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_algorithm_t alg = alg_arg;
+    psa_key_type_t type = type_arg;
+    size_t bits = bits_arg;
+    psa_status_t expected_status = expected_status_arg;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_key_attributes_t base_attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_attributes_t derived_attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&base_attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&base_attributes, alg);
+    psa_set_key_type(&base_attributes, PSA_KEY_TYPE_DERIVE);
+    PSA_ASSERT(psa_import_key(&base_attributes, key_data->x, key_data->len,
+                              &base_key));
+
+    if (!mbedtls_test_psa_setup_key_derivation_wrap(&operation, base_key, alg,
+                                                    input1->x, input1->len,
+                                                    input2->x, input2->len,
+                                                    SIZE_MAX, 0)) {
+        goto exit;
+    }
+
+    psa_set_key_usage_flags(&derived_attributes, PSA_KEY_USAGE_EXPORT);
+    psa_set_key_algorithm(&derived_attributes, 0);
+    psa_set_key_type(&derived_attributes, type);
+    psa_set_key_bits(&derived_attributes, bits);
+
+    psa_status_t status =
+        psa_key_derivation_output_key(&derived_attributes,
+                                      &operation,
+                                      &derived_key);
+    if (is_large_output > 0) {
+        TEST_ASSUME(status != PSA_ERROR_INSUFFICIENT_MEMORY);
+    }
+    TEST_EQUAL(status, expected_status);
+
+exit:
+    psa_key_derivation_abort(&operation);
+    psa_destroy_key(base_key);
+    psa_destroy_key(derived_key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void raw_key_agreement(int alg_arg,
+                       int our_key_type_arg, data_t *our_key_data,
+                       data_t *peer_key_data,
+                       data_t *expected_output)
+{
+    mbedtls_svc_key_id_t our_key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_algorithm_t alg = alg_arg;
+    psa_key_type_t our_key_type = our_key_type_arg;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    unsigned char *output = NULL;
+    size_t output_length = ~0;
+    size_t key_bits;
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, our_key_type);
+    PSA_ASSERT(psa_import_key(&attributes,
+                              our_key_data->x, our_key_data->len,
+                              &our_key));
+
+    PSA_ASSERT(psa_get_key_attributes(our_key, &attributes));
+    key_bits = psa_get_key_bits(&attributes);
+
+    /* Validate size macros */
+    TEST_LE_U(expected_output->len,
+              PSA_RAW_KEY_AGREEMENT_OUTPUT_SIZE(our_key_type, key_bits));
+    TEST_LE_U(PSA_RAW_KEY_AGREEMENT_OUTPUT_SIZE(our_key_type, key_bits),
+              PSA_RAW_KEY_AGREEMENT_OUTPUT_MAX_SIZE);
+
+    /* Good case with exact output size */
+    TEST_CALLOC(output, expected_output->len);
+    PSA_ASSERT(psa_raw_key_agreement(alg, our_key,
+                                     peer_key_data->x, peer_key_data->len,
+                                     output, expected_output->len,
+                                     &output_length));
+    TEST_MEMORY_COMPARE(output, output_length,
+                        expected_output->x, expected_output->len);
+    mbedtls_free(output);
+    output = NULL;
+    output_length = ~0;
+
+    /* Larger buffer */
+    TEST_CALLOC(output, expected_output->len + 1);
+    PSA_ASSERT(psa_raw_key_agreement(alg, our_key,
+                                     peer_key_data->x, peer_key_data->len,
+                                     output, expected_output->len + 1,
+                                     &output_length));
+    TEST_MEMORY_COMPARE(output, output_length,
+                        expected_output->x, expected_output->len);
+    mbedtls_free(output);
+    output = NULL;
+    output_length = ~0;
+
+    /* Buffer too small */
+    TEST_CALLOC(output, expected_output->len - 1);
+    TEST_EQUAL(psa_raw_key_agreement(alg, our_key,
+                                     peer_key_data->x, peer_key_data->len,
+                                     output, expected_output->len - 1,
+                                     &output_length),
+               PSA_ERROR_BUFFER_TOO_SMALL);
+    /* Not required by the spec, but good robustness */
+    TEST_LE_U(output_length, expected_output->len - 1);
+    mbedtls_free(output);
+    output = NULL;
+
+exit:
+    mbedtls_free(output);
+    psa_destroy_key(our_key);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void key_agreement_output(int alg_arg,
+                          int our_key_type_arg, data_t *our_key_data,
+                          data_t *peer_key_data,
+                          data_t *expected_output1, data_t *expected_output2)
+{
+    mbedtls_svc_key_id_t our_key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_algorithm_t alg = alg_arg;
+    psa_key_type_t our_key_type = our_key_type_arg;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    uint8_t *actual_output = NULL;
+
+    TEST_CALLOC(actual_output, MAX(expected_output1->len,
+                                   expected_output2->len));
+
+    PSA_ASSERT(psa_crypto_init());
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, our_key_type);
+    PSA_ASSERT(psa_import_key(&attributes,
+                              our_key_data->x, our_key_data->len,
+                              &our_key));
+
+    PSA_ASSERT(psa_key_derivation_setup(&operation, alg));
+    PSA_ASSERT(psa_key_derivation_key_agreement(
+                   &operation,
+                   PSA_KEY_DERIVATION_INPUT_SECRET, our_key,
+                   peer_key_data->x, peer_key_data->len));
+    if (PSA_ALG_IS_HKDF(PSA_ALG_KEY_AGREEMENT_GET_KDF(alg))) {
+        /* The test data is for info="" */
+        PSA_ASSERT(psa_key_derivation_input_bytes(&operation,
+                                                  PSA_KEY_DERIVATION_INPUT_INFO,
+                                                  NULL, 0));
+    }
+
+    PSA_ASSERT(psa_key_derivation_output_bytes(&operation,
+                                               actual_output,
+                                               expected_output1->len));
+    TEST_MEMORY_COMPARE(actual_output, expected_output1->len,
+                        expected_output1->x, expected_output1->len);
+    if (expected_output2->len != 0) {
+        PSA_ASSERT(psa_key_derivation_output_bytes(&operation,
+                                                   actual_output,
+                                                   expected_output2->len));
+        TEST_MEMORY_COMPARE(actual_output, expected_output2->len,
+                            expected_output2->x, expected_output2->len);
+    }
+
+exit:
+    psa_key_derivation_abort(&operation);
+    psa_destroy_key(our_key);
+    PSA_DONE();
+    mbedtls_free(actual_output);
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void generate_random(int bytes_arg)
+{
+    size_t bytes = bytes_arg;
+    unsigned char *output = NULL;
+    unsigned char *changed = NULL;
+    size_t i;
+    unsigned run;
+
+    TEST_ASSERT(bytes_arg >= 0);
+
+    TEST_CALLOC(output, bytes);
+    TEST_CALLOC(changed, bytes);
+
+    PSA_ASSERT(psa_crypto_init());
+
+    /* Run several times, to ensure that every output byte will be
+     * nonzero at least once with overwhelming probability
+     * (2^(-8*number_of_runs)). */
+    for (run = 0; run < 10; run++) {
+        if (bytes != 0) {
+            memset(output, 0, bytes);
+        }
+        PSA_ASSERT(psa_generate_random(output, bytes));
+
+        for (i = 0; i < bytes; i++) {
+            if (output[i] != 0) {
+                ++changed[i];
+            }
+        }
+    }
+
+    /* Check that every byte was changed to nonzero at least once. This
+     * validates that psa_generate_random is overwriting every byte of
+     * the output buffer. */
+    for (i = 0; i < bytes; i++) {
+        TEST_ASSERT(changed[i] != 0);
+    }
+
+exit:
+    PSA_DONE();
+    mbedtls_free(output);
+    mbedtls_free(changed);
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:PSA_WANT_ALG_JPAKE */
+void ecjpake_setup(int alg_arg, int key_type_pw_arg, int key_usage_pw_arg,
+                   int primitive_arg, int hash_arg, int role_arg,
+                   int test_input, data_t *pw_data,
+                   int inj_err_type_arg,
+                   int expected_error_arg)
+{
+    psa_pake_cipher_suite_t cipher_suite = psa_pake_cipher_suite_init();
+    psa_pake_operation_t operation = psa_pake_operation_init();
+    psa_algorithm_t alg = alg_arg;
+    psa_pake_primitive_t primitive = primitive_arg;
+    psa_key_type_t key_type_pw = key_type_pw_arg;
+    psa_key_usage_t key_usage_pw = key_usage_pw_arg;
+    psa_algorithm_t hash_alg = hash_arg;
+    psa_pake_role_t role = role_arg;
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    ecjpake_injected_failure_t inj_err_type = inj_err_type_arg;
+    psa_status_t expected_error = expected_error_arg;
+    psa_status_t status;
+    unsigned char *output_buffer = NULL;
+    size_t output_len = 0;
+
+    PSA_INIT();
+
+    size_t buf_size = PSA_PAKE_OUTPUT_SIZE(alg, primitive_arg,
+                                           PSA_PAKE_STEP_KEY_SHARE);
+    TEST_CALLOC(output_buffer, buf_size);
+
+    if (pw_data->len > 0) {
+        psa_set_key_usage_flags(&attributes, key_usage_pw);
+        psa_set_key_algorithm(&attributes, alg);
+        psa_set_key_type(&attributes, key_type_pw);
+        PSA_ASSERT(psa_import_key(&attributes, pw_data->x, pw_data->len,
+                                  &key));
+    }
+
+    psa_pake_cs_set_algorithm(&cipher_suite, alg);
+    psa_pake_cs_set_primitive(&cipher_suite, primitive);
+    psa_pake_cs_set_hash(&cipher_suite, hash_alg);
+
+    PSA_ASSERT(psa_pake_abort(&operation));
+
+    if (inj_err_type == INJECT_ERR_UNINITIALIZED_ACCESS) {
+        TEST_EQUAL(psa_pake_set_user(&operation, NULL, 0),
+                   expected_error);
+        PSA_ASSERT(psa_pake_abort(&operation));
+        TEST_EQUAL(psa_pake_set_peer(&operation, NULL, 0),
+                   expected_error);
+        PSA_ASSERT(psa_pake_abort(&operation));
+        TEST_EQUAL(psa_pake_set_password_key(&operation, key),
+                   expected_error);
+        PSA_ASSERT(psa_pake_abort(&operation));
+        TEST_EQUAL(psa_pake_set_role(&operation, role),
+                   expected_error);
+        PSA_ASSERT(psa_pake_abort(&operation));
+        TEST_EQUAL(psa_pake_output(&operation, PSA_PAKE_STEP_KEY_SHARE,
+                                   NULL, 0, NULL),
+                   expected_error);
+        PSA_ASSERT(psa_pake_abort(&operation));
+        TEST_EQUAL(psa_pake_input(&operation, PSA_PAKE_STEP_KEY_SHARE, NULL, 0),
+                   expected_error);
+        PSA_ASSERT(psa_pake_abort(&operation));
+        goto exit;
+    }
+
+    status = psa_pake_setup(&operation, &cipher_suite);
+    if (status != PSA_SUCCESS) {
+        TEST_EQUAL(status, expected_error);
+        goto exit;
+    }
+
+    if (inj_err_type == INJECT_ERR_DUPLICATE_SETUP) {
+        TEST_EQUAL(psa_pake_setup(&operation, &cipher_suite),
+                   expected_error);
+        goto exit;
+    }
+
+    status = psa_pake_set_role(&operation, role);
+    if (status != PSA_SUCCESS) {
+        TEST_EQUAL(status, expected_error);
+        goto exit;
+    }
+
+    if (pw_data->len > 0) {
+        status = psa_pake_set_password_key(&operation, key);
+        if (status != PSA_SUCCESS) {
+            TEST_EQUAL(status, expected_error);
+            goto exit;
+        }
+    }
+
+    if (inj_err_type == INJECT_ERR_INVALID_USER) {
+        TEST_EQUAL(psa_pake_set_user(&operation, NULL, 0),
+                   PSA_ERROR_INVALID_ARGUMENT);
+        goto exit;
+    }
+
+    if (inj_err_type == INJECT_ERR_INVALID_PEER) {
+        TEST_EQUAL(psa_pake_set_peer(&operation, NULL, 0),
+                   PSA_ERROR_INVALID_ARGUMENT);
+        goto exit;
+    }
+
+    if (inj_err_type == INJECT_ERR_SET_USER) {
+        const uint8_t unsupported_id[] = "abcd";
+        TEST_EQUAL(psa_pake_set_user(&operation, unsupported_id, 4),
+                   PSA_ERROR_NOT_SUPPORTED);
+        goto exit;
+    }
+
+    if (inj_err_type == INJECT_ERR_SET_PEER) {
+        const uint8_t unsupported_id[] = "abcd";
+        TEST_EQUAL(psa_pake_set_peer(&operation, unsupported_id, 4),
+                   PSA_ERROR_NOT_SUPPORTED);
+        goto exit;
+    }
+
+    const size_t size_key_share = PSA_PAKE_INPUT_SIZE(alg, primitive,
+                                                      PSA_PAKE_STEP_KEY_SHARE);
+    const size_t size_zk_public = PSA_PAKE_INPUT_SIZE(alg, primitive,
+                                                      PSA_PAKE_STEP_ZK_PUBLIC);
+    const size_t size_zk_proof = PSA_PAKE_INPUT_SIZE(alg, primitive,
+                                                     PSA_PAKE_STEP_ZK_PROOF);
+
+    if (test_input) {
+        if (inj_err_type == INJECT_EMPTY_IO_BUFFER) {
+            TEST_EQUAL(psa_pake_input(&operation, PSA_PAKE_STEP_ZK_PROOF, NULL, 0),
+                       PSA_ERROR_INVALID_ARGUMENT);
+            goto exit;
+        }
+
+        if (inj_err_type == INJECT_UNKNOWN_STEP) {
+            TEST_EQUAL(psa_pake_input(&operation, PSA_PAKE_STEP_ZK_PROOF + 10,
+                                      output_buffer, size_zk_proof),
+                       PSA_ERROR_INVALID_ARGUMENT);
+            goto exit;
+        }
+
+        if (inj_err_type == INJECT_INVALID_FIRST_STEP) {
+            TEST_EQUAL(psa_pake_input(&operation, PSA_PAKE_STEP_ZK_PROOF,
+                                      output_buffer, size_zk_proof),
+                       PSA_ERROR_BAD_STATE);
+            goto exit;
+        }
+
+        status = psa_pake_input(&operation, PSA_PAKE_STEP_KEY_SHARE,
+                                output_buffer, size_key_share);
+        if (status != PSA_SUCCESS) {
+            TEST_EQUAL(status, expected_error);
+            goto exit;
+        }
+
+        if (inj_err_type == INJECT_WRONG_BUFFER_SIZE) {
+            TEST_EQUAL(psa_pake_input(&operation, PSA_PAKE_STEP_ZK_PUBLIC,
+                                      output_buffer, size_zk_public + 1),
+                       PSA_ERROR_INVALID_ARGUMENT);
+            goto exit;
+        }
+
+        if (inj_err_type == INJECT_VALID_OPERATION_AFTER_FAILURE) {
+            // Just trigger any kind of error. We don't care about the result here
+            psa_pake_input(&operation, PSA_PAKE_STEP_ZK_PUBLIC,
+                           output_buffer, size_zk_public + 1);
+            TEST_EQUAL(psa_pake_input(&operation, PSA_PAKE_STEP_ZK_PUBLIC,
+                                      output_buffer, size_zk_public),
+                       PSA_ERROR_BAD_STATE);
+            goto exit;
+        }
+    } else {
+        if (inj_err_type == INJECT_EMPTY_IO_BUFFER) {
+            TEST_EQUAL(psa_pake_output(&operation, PSA_PAKE_STEP_ZK_PROOF,
+                                       NULL, 0, NULL),
+                       PSA_ERROR_INVALID_ARGUMENT);
+            goto exit;
+        }
+
+        if (inj_err_type == INJECT_UNKNOWN_STEP) {
+            TEST_EQUAL(psa_pake_output(&operation, PSA_PAKE_STEP_ZK_PROOF + 10,
+                                       output_buffer, buf_size, &output_len),
+                       PSA_ERROR_INVALID_ARGUMENT);
+            goto exit;
+        }
+
+        if (inj_err_type == INJECT_INVALID_FIRST_STEP) {
+            TEST_EQUAL(psa_pake_output(&operation, PSA_PAKE_STEP_ZK_PROOF,
+                                       output_buffer, buf_size, &output_len),
+                       PSA_ERROR_BAD_STATE);
+            goto exit;
+        }
+
+        status = psa_pake_output(&operation, PSA_PAKE_STEP_KEY_SHARE,
+                                 output_buffer, buf_size, &output_len);
+        if (status != PSA_SUCCESS) {
+            TEST_EQUAL(status, expected_error);
+            goto exit;
+        }
+
+        TEST_ASSERT(output_len > 0);
+
+        if (inj_err_type == INJECT_WRONG_BUFFER_SIZE) {
+            TEST_EQUAL(psa_pake_output(&operation, PSA_PAKE_STEP_ZK_PUBLIC,
+                                       output_buffer, size_zk_public - 1, &output_len),
+                       PSA_ERROR_BUFFER_TOO_SMALL);
+            goto exit;
+        }
+
+        if (inj_err_type == INJECT_VALID_OPERATION_AFTER_FAILURE) {
+            // Just trigger any kind of error. We don't care about the result here
+            psa_pake_output(&operation, PSA_PAKE_STEP_ZK_PUBLIC,
+                            output_buffer, size_zk_public - 1, &output_len);
+            TEST_EQUAL(psa_pake_output(&operation, PSA_PAKE_STEP_ZK_PUBLIC,
+                                       output_buffer, buf_size, &output_len),
+                       PSA_ERROR_BAD_STATE);
+            goto exit;
+        }
+    }
+
+exit:
+    PSA_ASSERT(psa_destroy_key(key));
+    PSA_ASSERT(psa_pake_abort(&operation));
+    mbedtls_free(output_buffer);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:PSA_WANT_ALG_JPAKE */
+void ecjpake_rounds_inject(int alg_arg, int primitive_arg, int hash_arg,
+                           int client_input_first, int inject_error,
+                           data_t *pw_data)
+{
+    psa_pake_cipher_suite_t cipher_suite = psa_pake_cipher_suite_init();
+    psa_pake_operation_t server = psa_pake_operation_init();
+    psa_pake_operation_t client = psa_pake_operation_init();
+    psa_algorithm_t alg = alg_arg;
+    psa_algorithm_t hash_alg = hash_arg;
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    PSA_INIT();
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_PASSWORD);
+    PSA_ASSERT(psa_import_key(&attributes, pw_data->x, pw_data->len,
+                              &key));
+
+    psa_pake_cs_set_algorithm(&cipher_suite, alg);
+    psa_pake_cs_set_primitive(&cipher_suite, primitive_arg);
+    psa_pake_cs_set_hash(&cipher_suite, hash_alg);
+
+
+    PSA_ASSERT(psa_pake_setup(&server, &cipher_suite));
+    PSA_ASSERT(psa_pake_setup(&client, &cipher_suite));
+
+    PSA_ASSERT(psa_pake_set_role(&server, PSA_PAKE_ROLE_SERVER));
+    PSA_ASSERT(psa_pake_set_role(&client, PSA_PAKE_ROLE_CLIENT));
+
+    PSA_ASSERT(psa_pake_set_password_key(&server, key));
+    PSA_ASSERT(psa_pake_set_password_key(&client, key));
+
+    ecjpake_do_round(alg, primitive_arg, &server, &client,
+                     client_input_first, 1, inject_error);
+
+    if (inject_error == 1 || inject_error == 2) {
+        goto exit;
+    }
+
+    ecjpake_do_round(alg, primitive_arg, &server, &client,
+                     client_input_first, 2, inject_error);
+
+exit:
+    psa_destroy_key(key);
+    psa_pake_abort(&server);
+    psa_pake_abort(&client);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE depends_on:PSA_WANT_ALG_JPAKE */
+void ecjpake_rounds(int alg_arg, int primitive_arg, int hash_arg,
+                    int derive_alg_arg, data_t *pw_data,
+                    int client_input_first, int inj_err_type_arg)
+{
+    psa_pake_cipher_suite_t cipher_suite = psa_pake_cipher_suite_init();
+    psa_pake_operation_t server = psa_pake_operation_init();
+    psa_pake_operation_t client = psa_pake_operation_init();
+    psa_algorithm_t alg = alg_arg;
+    psa_algorithm_t hash_alg = hash_arg;
+    psa_algorithm_t derive_alg = derive_alg_arg;
+    mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_derivation_operation_t server_derive =
+        PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_key_derivation_operation_t client_derive =
+        PSA_KEY_DERIVATION_OPERATION_INIT;
+    ecjpake_injected_failure_t inj_err_type = inj_err_type_arg;
+
+    PSA_INIT();
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_PASSWORD);
+    PSA_ASSERT(psa_import_key(&attributes, pw_data->x, pw_data->len,
+                              &key));
+
+    psa_pake_cs_set_algorithm(&cipher_suite, alg);
+    psa_pake_cs_set_primitive(&cipher_suite, primitive_arg);
+    psa_pake_cs_set_hash(&cipher_suite, hash_alg);
+
+    /* Get shared key */
+    PSA_ASSERT(psa_key_derivation_setup(&server_derive, derive_alg));
+    PSA_ASSERT(psa_key_derivation_setup(&client_derive, derive_alg));
+
+    if (PSA_ALG_IS_TLS12_PRF(derive_alg) ||
+        PSA_ALG_IS_TLS12_PSK_TO_MS(derive_alg)) {
+        PSA_ASSERT(psa_key_derivation_input_bytes(&server_derive,
+                                                  PSA_KEY_DERIVATION_INPUT_SEED,
+                                                  (const uint8_t *) "", 0));
+        PSA_ASSERT(psa_key_derivation_input_bytes(&client_derive,
+                                                  PSA_KEY_DERIVATION_INPUT_SEED,
+                                                  (const uint8_t *) "", 0));
+    }
+
+    PSA_ASSERT(psa_pake_setup(&server, &cipher_suite));
+    PSA_ASSERT(psa_pake_setup(&client, &cipher_suite));
+
+    PSA_ASSERT(psa_pake_set_role(&server, PSA_PAKE_ROLE_SERVER));
+    PSA_ASSERT(psa_pake_set_role(&client, PSA_PAKE_ROLE_CLIENT));
+
+    PSA_ASSERT(psa_pake_set_password_key(&server, key));
+    PSA_ASSERT(psa_pake_set_password_key(&client, key));
+
+    if (inj_err_type == INJECT_ANTICIPATE_KEY_DERIVATION_1) {
+        TEST_EQUAL(psa_pake_get_implicit_key(&server, &server_derive),
+                   PSA_ERROR_BAD_STATE);
+        TEST_EQUAL(psa_pake_get_implicit_key(&client, &client_derive),
+                   PSA_ERROR_BAD_STATE);
+        goto exit;
+    }
+
+    /* First round */
+    ecjpake_do_round(alg, primitive_arg, &server, &client,
+                     client_input_first, 1, 0);
+
+    if (inj_err_type == INJECT_ANTICIPATE_KEY_DERIVATION_2) {
+        TEST_EQUAL(psa_pake_get_implicit_key(&server, &server_derive),
+                   PSA_ERROR_BAD_STATE);
+        TEST_EQUAL(psa_pake_get_implicit_key(&client, &client_derive),
+                   PSA_ERROR_BAD_STATE);
+        goto exit;
+    }
+
+    /* Second round */
+    ecjpake_do_round(alg, primitive_arg, &server, &client,
+                     client_input_first, 2, 0);
+
+    PSA_ASSERT(psa_pake_get_implicit_key(&server, &server_derive));
+    PSA_ASSERT(psa_pake_get_implicit_key(&client, &client_derive));
+
+exit:
+    psa_key_derivation_abort(&server_derive);
+    psa_key_derivation_abort(&client_derive);
+    psa_destroy_key(key);
+    psa_pake_abort(&server);
+    psa_pake_abort(&client);
+    PSA_DONE();
+}
+/* END_CASE */
+
+/* BEGIN_CASE */
+void ecjpake_size_macros()
+{
+    const psa_algorithm_t alg = PSA_ALG_JPAKE;
+    const size_t bits = 256;
+    const psa_pake_primitive_t prim = PSA_PAKE_PRIMITIVE(
+        PSA_PAKE_PRIMITIVE_TYPE_ECC, PSA_ECC_FAMILY_SECP_R1, bits);
+    const psa_key_type_t key_type = PSA_KEY_TYPE_ECC_KEY_PAIR(
+        PSA_ECC_FAMILY_SECP_R1);
+
+    // https://armmbed.github.io/mbed-crypto/1.1_PAKE_Extension.0-bet.0/html/pake.html#pake-step-types
+    /* The output for KEY_SHARE and ZK_PUBLIC is the same as a public key */
+    TEST_EQUAL(PSA_PAKE_OUTPUT_SIZE(alg, prim, PSA_PAKE_STEP_KEY_SHARE),
+               PSA_EXPORT_PUBLIC_KEY_OUTPUT_SIZE(key_type, bits));
+    TEST_EQUAL(PSA_PAKE_OUTPUT_SIZE(alg, prim, PSA_PAKE_STEP_ZK_PUBLIC),
+               PSA_EXPORT_PUBLIC_KEY_OUTPUT_SIZE(key_type, bits));
+    /* The output for ZK_PROOF is the same bitsize as the curve */
+    TEST_EQUAL(PSA_PAKE_OUTPUT_SIZE(alg, prim, PSA_PAKE_STEP_ZK_PROOF),
+               PSA_BITS_TO_BYTES(bits));
+
+    /* Input sizes are the same as output sizes */
+    TEST_EQUAL(PSA_PAKE_OUTPUT_SIZE(alg, prim, PSA_PAKE_STEP_KEY_SHARE),
+               PSA_PAKE_INPUT_SIZE(alg, prim, PSA_PAKE_STEP_KEY_SHARE));
+    TEST_EQUAL(PSA_PAKE_OUTPUT_SIZE(alg, prim, PSA_PAKE_STEP_ZK_PUBLIC),
+               PSA_PAKE_INPUT_SIZE(alg, prim, PSA_PAKE_STEP_ZK_PUBLIC));
+    TEST_EQUAL(PSA_PAKE_OUTPUT_SIZE(alg, prim, PSA_PAKE_STEP_ZK_PROOF),
+               PSA_PAKE_INPUT_SIZE(alg, prim, PSA_PAKE_STEP_ZK_PROOF));
+
+    /* These inequalities will always hold even when other PAKEs are added */
+    TEST_LE_U(PSA_PAKE_OUTPUT_SIZE(alg, prim, PSA_PAKE_STEP_KEY_SHARE),
+              PSA_PAKE_OUTPUT_MAX_SIZE);
+    TEST_LE_U(PSA_PAKE_OUTPUT_SIZE(alg, prim, PSA_PAKE_STEP_ZK_PUBLIC),
+              PSA_PAKE_OUTPUT_MAX_SIZE);
+    TEST_LE_U(PSA_PAKE_OUTPUT_SIZE(alg, prim, PSA_PAKE_STEP_ZK_PROOF),
+              PSA_PAKE_OUTPUT_MAX_SIZE);
+    TEST_LE_U(PSA_PAKE_INPUT_SIZE(alg, prim, PSA_PAKE_STEP_KEY_SHARE),
+              PSA_PAKE_INPUT_MAX_SIZE);
+    TEST_LE_U(PSA_PAKE_INPUT_SIZE(alg, prim, PSA_PAKE_STEP_ZK_PUBLIC),
+              PSA_PAKE_INPUT_MAX_SIZE);
+    TEST_LE_U(PSA_PAKE_INPUT_SIZE(alg, prim, PSA_PAKE_STEP_ZK_PROOF),
+              PSA_PAKE_INPUT_MAX_SIZE);
+}
+/* END_CASE */

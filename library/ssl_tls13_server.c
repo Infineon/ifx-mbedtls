@@ -93,7 +93,7 @@ static void ssl_tls13_select_ciphersuite(
     }
 
     MBEDTLS_SSL_DEBUG_MSG(2, ("No matched ciphersuite, psk_ciphersuite_id=%x, psk_hash_alg=%x",
-                              (unsigned) psk_ciphersuite_id, psk_hash_alg));
+                              (unsigned) psk_ciphersuite_id, (unsigned) psk_hash_alg));
 }
 
 #if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_PSK_ENABLED)

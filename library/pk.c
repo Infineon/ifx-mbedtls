@@ -898,9 +898,8 @@ static int copy_from_psa(mbedtls_svc_key_id_t key_id,
         key_type = PSA_KEY_TYPE_PUBLIC_KEY_OF_KEY_PAIR(key_type);
     }
     key_bits = psa_get_key_bits(&key_attr);
-#if defined(MBEDTLS_RSA_C)
-    psa_algorithm_t alg_type = psa_get_key_algorithm(&key_attr);
 
+#if defined(MBEDTLS_RSA_C)
     if ((key_type == PSA_KEY_TYPE_RSA_KEY_PAIR) ||
         (key_type == PSA_KEY_TYPE_RSA_PUBLIC_KEY)) {
 
@@ -918,6 +917,7 @@ static int copy_from_psa(mbedtls_svc_key_id_t key_id,
             goto exit;
         }
 
+        psa_algorithm_t alg_type = psa_get_key_algorithm(&key_attr);
         mbedtls_md_type_t md_type = MBEDTLS_MD_NONE;
         if (PSA_ALG_GET_HASH(alg_type) != PSA_ALG_ANY_HASH) {
             md_type = mbedtls_md_type_from_psa_alg(alg_type);
@@ -967,6 +967,7 @@ static int copy_from_psa(mbedtls_svc_key_id_t key_id,
     } else
 #endif /* MBEDTLS_PK_HAVE_ECC_KEYS */
     {
+        (void) key_bits;
         return MBEDTLS_ERR_PK_BAD_INPUT_DATA;
     }
 

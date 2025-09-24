@@ -240,6 +240,8 @@ static int ssl_tls13_parse_certificate_verify(mbedtls_ssl_context *ssl,
     MBEDTLS_SSL_CHK_BUF_READ_PTR(p, end, 2);
     algorithm = MBEDTLS_GET_UINT16_BE(p, 0);
     p += 2;
+    /* Void to avoid warning when logging is disabled */
+    (void)ret;
 
     /* RFC 8446 section 4.4.3
      *

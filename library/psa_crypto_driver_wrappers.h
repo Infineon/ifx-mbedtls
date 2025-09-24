@@ -3868,16 +3868,6 @@ static inline psa_status_t psa_driver_wrapper_asymmetric_encrypt(
             if( status != PSA_ERROR_NOT_SUPPORTED )
                 return( status );
 #endif /* IFX_PSA_MXCRYPTO_PRESENT && IFX_PSA_MXCRYPTO_RSA_ENCRYPT */
-#if defined(IFX_PSA_CRYPTOLITE_PRESENT) && defined(IFX_PSA_CRYPTOLITE_RSA_ENCRYPT)
-/* TODO: Enable after DRIVERS-21151 is done */
-#if 0
-            status = ifx_cryptolite_transparent_asymmetric_encrypt( attributes,
-                        key_buffer, key_buffer_size, alg, input, input_length,
-                        salt, salt_length, output, output_size, output_length);
-            if( status != PSA_ERROR_NOT_SUPPORTED )
-                return( status );
-#endif
-#endif /* IFX_PSA_CRYPTOLITE_PRESENT && IFX_PSA_CRYPTOLITE_RSA_ENCRYPT */
 #endif /* PSA_CRYPTO_ACCELERATOR_DRIVER_PRESENT */
             return( mbedtls_psa_asymmetric_encrypt( attributes,
                         key_buffer, key_buffer_size, alg, input, input_length,
@@ -3948,16 +3938,6 @@ static inline psa_status_t psa_driver_wrapper_asymmetric_decrypt(
             if( status != PSA_ERROR_NOT_SUPPORTED )
                 return( status );
 #endif /* IFX_PSA_MXCRYPTO_PRESENT && IFX_PSA_MXCRYPTO_RSA_DECRYPT */
-#if defined(IFX_PSA_CRYPTOLITE_PRESENT) && defined(IFX_PSA_CRYPTOLITE_RSA_DECRYPT)
-/* TODO: Enable after DRIVERS-21151 is done */
-#if 0
-            status = ifx_cryptolite_transparent_asymmetric_decrypt( attributes,
-                        key_buffer, key_buffer_size, alg, input, input_length,
-                        salt, salt_length, output, output_size, output_length);
-            if( status != PSA_ERROR_NOT_SUPPORTED )
-                return( status );
-#endif
-#endif /* IFX_PSA_CRYPTOLITE_PRESENT && IFX_PSA_CRYPTOLITE_RSA_DECRYPT */
 #endif /* PSA_CRYPTO_ACCELERATOR_DRIVER_PRESENT */
             return( mbedtls_psa_asymmetric_decrypt( attributes,
                         key_buffer, key_buffer_size, alg,input, input_length,

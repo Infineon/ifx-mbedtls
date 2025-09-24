@@ -31,6 +31,17 @@ static psa_status_t mbedtls_psa_ffdh_set_prime_generator(size_t key_size,
                                                          mbedtls_mpi *P,
                                                          mbedtls_mpi *G)
 {
+#if ((!defined(MBEDTLS_PSA_BUILTIN_DH_RFC7919_2048)) && \
+    (!defined(MBEDTLS_PSA_BUILTIN_DH_RFC7919_3072)) &&  \
+    (!defined(MBEDTLS_PSA_BUILTIN_DH_RFC7919_4096)) &&  \
+    (!defined(MBEDTLS_PSA_BUILTIN_DH_RFC7919_6144)) &&  \
+    (!defined(MBEDTLS_PSA_BUILTIN_DH_RFC7919_8192)))
+    (void)key_size;
+    (void)P;
+    (void)G;
+
+    return PSA_ERROR_NOT_SUPPORTED;
+#else
     const unsigned char *dhm_P = NULL;
     const unsigned char *dhm_G = NULL;
     size_t dhm_size_P = 0;
@@ -132,6 +143,7 @@ cleanup:
     }
 
     return PSA_SUCCESS;
+#endif
 }
 #endif /* MBEDTLS_PSA_BUILTIN_KEY_TYPE_DH_KEY_PAIR_EXPORT ||
           MBEDTLS_PSA_BUILTIN_KEY_TYPE_DH_KEY_PAIR_GENERATE ||

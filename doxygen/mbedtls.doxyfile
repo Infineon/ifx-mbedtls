@@ -1,4 +1,4 @@
-PROJECT_NAME           = "Mbed TLS v3.6.100"
+PROJECT_NAME           = "Mbed TLS v3.6.200"
 OUTPUT_DIRECTORY       = ../apidoc/
 FULL_PATH_NAMES        = NO
 OPTIMIZE_OUTPUT_FOR_C  = YES

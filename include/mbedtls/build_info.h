@@ -24,18 +24,25 @@
  * The version number x.y.z is split into three parts.
  * Major, Minor, Patchlevel
  */
-#define MBEDTLS_VERSION_MAJOR  3
-#define MBEDTLS_VERSION_MINOR  6
-#define MBEDTLS_VERSION_PATCH  300
+#define MBEDTLS_VERSION_MAJOR           3
+#define MBEDTLS_VERSION_MINOR           6
+#define MBEDTLS_UPSTREAM_VERSION_PATCH  0
+#define IFX_MBEDTLS_VERSION_PATCH       400
+/**
+ * MbedTLS has limitation in patch versioning of 1 byte, but Infineon's
+ * versioning scheme requires more than 255 patch versions. So we are using the
+ * below formula to calculate the final patch version.
+ */
+#define MBEDTLS_VERSION_PATCH (0xFF - (IFX_MBEDTLS_VERSION_PATCH / 100) - MBEDTLS_UPSTREAM_VERSION_PATCH)
 
 /**
  * The single version number has the following structure:
  *    MMNNPP00
  *    Major version | Minor version | Patch version
  */
-#define MBEDTLS_VERSION_NUMBER         0x030612C0
-#define MBEDTLS_VERSION_STRING         "3.6.300"
-#define MBEDTLS_VERSION_STRING_FULL    "Mbed TLS 3.6.300"
+#define MBEDTLS_VERSION_NUMBER         0x0306FB00
+#define MBEDTLS_VERSION_STRING         "3.6.251"
+#define MBEDTLS_VERSION_STRING_FULL    "Mbed TLS 3.6.251"
 
 /* Macros for build-time platform detection */
 
